@@ -1,0 +1,1 @@
+{"root":["./src/app.tsx","./src/main.tsx","./src/game/aiagent.ts","./src/game/engine.ts","./src/game/trainer.ts","./tests/engine.test.ts"],"version":"5.7.3"}
