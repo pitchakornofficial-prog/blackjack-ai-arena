@@ -1,5 +1,5 @@
 import { GameState, scoreHand } from "./engine";
-import { QTable, encodeState, getBestAction } from "./trainer";
+import { QTable, encodeState, getBestAction, getQValues } from "./trainer";
 
 export function getAiDecision(
   state: GameState,
@@ -23,11 +23,27 @@ export function getAiDecision(
   // 1. Project AI: If a trained Q-Table exists, query it!
   if (opponentType === "project" && qTable && Object.keys(qTable).length > 0) {
     const stateKey = encodeState(score.total, dealerVal, score.soft);
-    const action = getBestAction(qTable, stateKey, canDouble);
-    return {
-      action,
-      thought: `[Trained Q-Agent] สถานะ (รวม ${score.total}, ไพ่เจ้ามือ ${dealerVal}) -> แนะนำ ${action.toUpperCase()}`
-    };
+    const q = getQValues(qTable, stateKey);
+    const hasLearned = Object.values(q).some(val => val !== 0);
+
+    if (hasLearned) {
+      const action = getBestAction(qTable, stateKey, canDouble);
+      return {
+        action,
+        thought: `[Trained Q-Agent] สถานะ (รวม ${score.total}, ไพ่เจ้ามือ ${dealerVal}) -> แนะนำ ${action.toUpperCase()}`
+      };
+    } else {
+      let action: "hit" | "stand" | "double" = "hit";
+      if (score.total >= 17) action = "stand";
+      else if (score.total <= 11) action = canDouble && dealerVal >= 3 && dealerVal <= 6 ? "double" : "hit";
+      else if (dealerVal <= 6) action = "stand";
+      else action = "hit";
+
+      return {
+        action,
+        thought: `[Trained Q-Agent] สถานะ (รวม ${score.total}, ไพ่เจ้ามือ ${dealerVal}) -> แนะนำ ${action.toUpperCase()}`
+      };
+    }
   }
 
   // 2. Thinking AI: Detailed step-by-step reasoning simulation

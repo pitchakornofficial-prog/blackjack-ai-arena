@@ -37,6 +37,7 @@ export type GameState = {
   aiThought?: string;
   duelMessage?: string;
   duelWinner?: "player" | "ai" | "dealer" | "tie";
+  turnStep: number;
 };
 
 const suits: Suit[] = ["♠", "♥", "♦", "♣"];
@@ -117,7 +118,8 @@ export function newGame(
     round: 0,
     playMode,
     aiBankroll: 1000,
-    currentTurn: "player"
+    currentTurn: "player",
+    turnStep: 0
   };
 }
 
@@ -145,7 +147,8 @@ export function startRound(state: GameState, bet = state.initialBet): GameState 
     aiThought: undefined,
     duelMessage: undefined,
     duelWinner: undefined,
-    round: state.round + 1
+    round: state.round + 1,
+    turnStep: (state.turnStep ?? 0) + 1
   };
 
   const playerCards = [draw(next), draw(next)];
@@ -196,7 +199,8 @@ export function applyAction(state: GameState, action: Action, random?: () => num
     shoe: [...state.shoe],
     playerHands: state.playerHands.map(h => ({ ...h, cards: [...h.cards] })),
     dealer: [...state.dealer],
-    lastAction: action
+    lastAction: action,
+    turnStep: (state.turnStep ?? 0) + 1
   };
 
   const current = next.playerHands[next.activeHand];
@@ -289,7 +293,8 @@ export function applyAiAction(
     shoe: [...state.shoe],
     aiHand: { ...state.aiHand, cards: [...state.aiHand.cards] },
     aiLastAction: action,
-    aiThought: thought
+    aiThought: thought,
+    turnStep: (state.turnStep ?? 0) + 1
   };
 
   const ai = next.aiHand!;

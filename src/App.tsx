@@ -2,7 +2,8 @@ import { useEffect, useMemo, useState } from "react";
 import {
   ArrowLeft, ArrowRight, BrainCircuit, BookOpen, CircleHelp, Clock3, Code2,
   Cpu, FolderKanban, Gauge, House, Info, Play, Plus, RotateCcw, Settings2,
-  ShieldCheck, Sparkles, Swords, Trophy, WandSparkles, X, CheckCircle2, Cloud
+  ShieldCheck, Sparkles, Swords, Trophy, WandSparkles, X, CheckCircle2, Cloud,
+  Layers, Maximize2, Minimize2
 } from "lucide-react";
 import {
   Action, Card as PlayingCard, GameState, applyAction, applyAiAction,
@@ -10,6 +11,9 @@ import {
 } from "./game/engine";
 import { QTable, MetricPoint, trainBatch } from "./game/trainer";
 import { getAiDecision } from "./game/aiAgent";
+import ChessView from "./game/ChessView";
+
+type ActiveGame = "blackjack" | "chess";
 
 type Page = "home" | "play" | "training" | "projects" | "rules" | "help";
 type Opponent = "baseline" | "thinking" | "project";
@@ -60,6 +64,9 @@ const initialProjects: TrainingProject[] = [
 ];
 
 export default function App() {
+  const [activeGame, setActiveGame] = useState<ActiveGame>("blackjack");
+  const [showGameModal, setShowGameModal] = useState(false);
+  const [isFullscreen, setIsFullscreen] = useState(false);
   const [page, setPage] = useState<Page>("home");
   const [game, setGame] = useState<GameState>(() => newGame(Math.random, "play", "duel"));
   const [bet, setBet] = useState(100);
@@ -69,6 +76,7 @@ export default function App() {
   const [projectName, setProjectName] = useState("My Blackjack Agent");
   const [trainMinutes, setTrainMinutes] = useState(1);
   const [activeTrainingId, setActiveTrainingId] = useState<number | null>(1);
+  const [selectedPlayProjectId, setSelectedPlayProjectId] = useState<number | null>(1);
   const [trainingSeconds, setTrainingSeconds] = useState(0);
   const [trainingRunning, setTrainingRunning] = useState(false);
   const [trainingStartedAt, setTrainingStartedAt] = useState<number | null>(null);
@@ -101,6 +109,7 @@ export default function App() {
   const [duelStats, setDuelStats] = useState({ playerWins: 0, aiWins: 0, ties: 0 });
 
   const activeProject = useMemo(() => projects.find(p => p.id === activeTrainingId), [projects, activeTrainingId]);
+  const selectedPlayProject = useMemo(() => projects.find(p => p.id === selectedPlayProjectId) ?? projects[0], [projects, selectedPlayProjectId]);
   const totalTrainingSeconds = trainMinutes * 60;
   const actions = useMemo(() => legalActions(game), [game]);
   const hand = game.playerHands[game.activeHand];
@@ -147,12 +156,13 @@ export default function App() {
   useEffect(() => {
     if (game.playMode === "duel" && game.phase === "player" && game.currentTurn === "ai") {
       const timer = window.setTimeout(() => {
-        const decision = getAiDecision(game, opponent, activeProject?.qTable);
+        const qTableToUse = opponent === "project" ? selectedPlayProject?.qTable : undefined;
+        const decision = getAiDecision(game, opponent, qTableToUse);
         setGame(g => applyAiAction(g, decision.action, decision.thought));
       }, 800);
       return () => window.clearTimeout(timer);
     }
-  }, [game.playMode, game.phase, game.currentTurn, opponent, activeProject?.qTable]);
+  }, [game.playMode, game.phase, game.currentTurn, game.turnStep, opponent, selectedPlayProject?.qTable]);
 
   // Wall-clock Timer and Real Simulation Loop
   useEffect(() => {
@@ -263,14 +273,26 @@ export default function App() {
     setPage("projects");
   }
 
-  function beginTraining(project: TrainingProject) {
-    setProjects(old => old.map(p => p.id === project.id ? { ...p, minutes: trainMinutes, status: "Training", progress: 0, games: 0 } : p));
+  function beginTraining(project: TrainingProject, resumeAccumulated: boolean = true) {
+    setProjects(old => old.map(p => {
+      if (p.id !== project.id) return p;
+      return {
+        ...p,
+        minutes: trainMinutes,
+        status: "Training",
+        progress: 0,
+        games: resumeAccumulated ? p.games : 0,
+        qTable: resumeAccumulated ? (p.qTable ? { ...p.qTable } : {}) : {}
+      };
+    }));
     setActiveTrainingId(project.id);
     setTrainingSeconds(0);
     setTrainingBaseSeconds(0);
     setTrainingStartedAt(Date.now());
     setTrainingRunning(true);
-    setMetricHistory([]);
+    if (!resumeAccumulated) {
+      setMetricHistory([]);
+    }
     setPage("training");
   }
 
@@ -315,6 +337,34 @@ export default function App() {
   function fmt(seconds: number) {
     return `${Math.floor(seconds / 60).toString().padStart(2, "0")}:${(seconds % 60).toString().padStart(2, "0")}`;
   }
+
+  function toggleFullscreen() {
+    if (!document.fullscreenElement) {
+      document.documentElement.requestFullscreen().then(() => {
+        setIsFullscreen(true);
+      }).catch(() => {
+        setIsFullscreen(prev => !prev);
+      });
+    } else {
+      if (document.exitFullscreen) {
+        document.exitFullscreen().then(() => {
+          setIsFullscreen(false);
+        }).catch(() => {
+          setIsFullscreen(false);
+        });
+      } else {
+        setIsFullscreen(false);
+      }
+    }
+  }
+
+  useEffect(() => {
+    function onFullscreenChange() {
+      setIsFullscreen(!!document.fullscreenElement);
+    }
+    document.addEventListener("fullscreenchange", onFullscreenChange);
+    return () => document.removeEventListener("fullscreenchange", onFullscreenChange);
+  }, []);
 
   function navItem(id: Page, label: string, Icon: typeof House) {
     return (
@@ -410,23 +460,45 @@ export default function App() {
   const latestMetric = metricHistory[metricHistory.length - 1];
 
   return (
-    <div className="app-layout">
+    <div className={`app-layout ${isFullscreen ? "fullscreen-mode" : ""}`}>
       <aside className="sidebar">
-        <button className="brand" onClick={() => setPage("home")}>
-          <span className="brand-icon">♠</span>
-          <span>BLACKJACK<small>AI ARENA</small></span>
-        </button>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "0 4px 22px" }}>
+          <button className="brand" style={{ padding: 0 }} onClick={() => setPage("home")}>
+            <span className="brand-icon">{activeGame === "blackjack" ? "♠" : "♞"}</span>
+            <span>
+              {activeGame === "blackjack" ? "BLACKJACK" : "CHESS"}
+              <small>AI ARENA HUB</small>
+            </span>
+          </button>
+          <button className="game-switch-btn" title="คลิกเพื่อเลือกเกม" onClick={() => setShowGameModal(true)}>
+            <Layers size={12} /> สลับ
+          </button>
+        </div>
+
         <div className="nav-label">WORKSPACE</div>
-        {navItem("home", "ภาพรวม", House)}
-        {navItem("play", "เล่นเกม (Arena)", Swords)}
-        {navItem("training", "AI Training", BrainCircuit)}
-        {navItem("projects", "โปรเจกต์ AI", FolderKanban)}
-        <div className="nav-label nav-label-spaced">LEARN & SUPPORT</div>
-        {navItem("rules", "วิธีเล่นและกติกา", BookOpen)}
-        {navItem("help", "ช่วยเล่น", WandSparkles)}
+        {activeGame === "blackjack" ? (
+          <>
+            {navItem("home", "ภาพรวม", House)}
+            {navItem("play", "เล่นเกม (Arena)", Swords)}
+            {navItem("training", "AI Training", BrainCircuit)}
+            {navItem("projects", "โปรเจกต์ AI", FolderKanban)}
+            <div className="nav-label nav-label-spaced">LEARN & SUPPORT</div>
+            {navItem("rules", "วิธีเล่นและกติกา", BookOpen)}
+            {navItem("help", "ช่วยเล่น", WandSparkles)}
+          </>
+        ) : (
+          <>
+            {navItem("home", "ภาพรวมหมากรุก", House)}
+            {navItem("play", "กระดานหมากรุก", Swords)}
+            {navItem("training", "Chess AI Training", BrainCircuit)}
+            {navItem("projects", "โปรเจกต์ Chess AI", FolderKanban)}
+            <div className="nav-label nav-label-spaced">LEARN & SUPPORT</div>
+            {navItem("rules", "กติกาหมากรุกสากล", BookOpen)}
+          </>
+        )}
         <div className="sidebar-bottom">
-          <div className="avatar">AI</div>
-          <div><strong>Local Workspace</strong><small>Prototype v0.5</small></div>
+          <div className="avatar">{activeGame === "blackjack" ? "BJ" : "CH"}</div>
+          <div><strong>Arena Hub</strong><small>{activeGame === "blackjack" ? "Blackjack Mode" : "Chess Mode"}</small></div>
           <span className="online-dot" />
         </div>
       </aside>
@@ -434,13 +506,37 @@ export default function App() {
       <main className="main-content">
         <header className="topbar">
           <div className="breadcrumb">
-            ARENA <span>/</span> {({ home: "OVERVIEW", play: "PLAY ARENA", training: "AI TRAINING", projects: "AI PROJECTS", rules: "HOW TO PLAY", help: "PLAY ASSIST" } as Record<Page, string>)[page]}
+            ARENA <span>/</span> {activeGame.toUpperCase()} <span>/</span> {page.toUpperCase()}
           </div>
           <div className="topbar-right">
+            <button
+              className={`fullscreen-btn ${isFullscreen ? "active" : ""}`}
+              onClick={toggleFullscreen}
+              title={isFullscreen ? "ออกจากโหมดเต็มจอ (ESC)" : "เข้าสู่โหมดเต็มจอ"}
+            >
+              {isFullscreen ? <Minimize2 size={13} /> : <Maximize2 size={13} />}
+              <span>{isFullscreen ? "ย่อหน้าจอ (ESC)" : "เต็มจอ"}</span>
+            </button>
+            <button className="game-switch-btn" onClick={() => setShowGameModal(true)}>
+              <Layers size={13} /> {activeGame === "blackjack" ? "♠ Blackjack Arena" : "♞ Chess Arena"} <small>(สลับเกม)</small>
+            </button>
             <span className="status-dot" /> LOCAL SESSION
-            <button className="top-icon" title="เริ่มเกมใหม่" onClick={resetGame}><RotateCcw size={15} /></button>
+            <button className="top-icon" title="เริ่มเกมใหม่" onClick={() => { if (activeGame === "blackjack") resetGame(); }}>
+              <RotateCcw size={15} />
+            </button>
           </div>
         </header>
+
+        {activeGame === "chess" ? (
+          <ChessView
+            page={page}
+            setPage={setPage}
+            onOpenGameModal={() => setShowGameModal(true)}
+            isFullscreen={isFullscreen}
+            onToggleFullscreen={toggleFullscreen}
+          />
+        ) : (
+          <>
 
         {/* ================= PAGE: HOME ================= */}
         {page === "home" && (
@@ -516,11 +612,19 @@ export default function App() {
                 <h1>Blackjack Duel Arena</h1>
                 <p className="lede">ลงโต๊ะดวลสลับตากับ AI คู่แข่ง ทั้งสองฝ่ายเล่นพร้อมกันแข่งกับเจ้ามือ</p>
               </div>
-              <div style={{ display: "flex", gap: 8 }}>
+              <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
                 <div className="scoreboard-badge">
                   <span>ARENA DUEL:</span>
                   <strong>คุณ {duelStats.playerWins}</strong> · <strong>AI {duelStats.aiWins}</strong> · เสมอ {duelStats.ties}
                 </div>
+                <button
+                  className={`fullscreen-btn ${isFullscreen ? "active" : ""}`}
+                  onClick={toggleFullscreen}
+                  title="เปิด/ปิดโหมดเต็มจอ"
+                >
+                  {isFullscreen ? <Minimize2 size={13} /> : <Maximize2 size={13} />}
+                  <span>{isFullscreen ? "ออกจากเต็มจอ" : "เต็มจอ"}</span>
+                </button>
                 <button className="ghost-button" onClick={() => setPage("rules")}><BookOpen size={15} /> กติกา</button>
               </div>
             </div>
@@ -560,9 +664,50 @@ export default function App() {
                 <span className="opponent-tag">YOUR MODEL</span>
                 <h3>Project AI</h3>
                 <p>ใช้โมเดล Q-Learning ที่คุณฝึกเสร็จจากหน้า Training Lab</p>
-                <small>{activeProject?.qTable && Object.keys(activeProject.qTable).length > 0 ? "TRAINED MODEL READY" : "DEFAULT POLICY"}</small>
+                <small>{selectedPlayProject ? `${selectedPlayProject.name} (${selectedPlayProject.qTable ? Object.keys(selectedPlayProject.qTable).length : 0} Q-States)` : "DEFAULT POLICY"}</small>
               </button>
             </div>
+
+            {opponent === "project" && (
+              <div className="project-ai-selector-box">
+                <div className="selector-title">
+                  <FolderKanban size={16} />
+                  <strong>เลือกโปรเจกต์ AI ที่ต้องการนำมาลงแข่งใน Arena:</strong>
+                </div>
+                <select
+                  value={selectedPlayProjectId ?? ""}
+                  onChange={e => setSelectedPlayProjectId(Number(e.target.value))}
+                >
+                  {projects.map(p => (
+                    <option key={p.id} value={p.id}>
+                      {p.name} — {p.qTable && Object.keys(p.qTable).length > 0 ? `ฝึกแล้ว ${p.games.toLocaleString()} มือ (${Object.keys(p.qTable).length} Q-States)` : "ยังไม่ได้ฝึก (0 มือ)"}
+                    </option>
+                  ))}
+                </select>
+                {selectedPlayProject && (
+                  <div className="selected-project-badge">
+                    {selectedPlayProject.qTable && Object.keys(selectedPlayProject.qTable).length > 0 ? (
+                      <span className="badge-ready">
+                        <CheckCircle2 size={13} /> กำลังใช้โมเดลจริง: <strong>{selectedPlayProject.name}</strong> ({selectedPlayProject.games.toLocaleString()} มือที่ฝึกมา · {Object.keys(selectedPlayProject.qTable).length} states ใน Q-Table)
+                      </span>
+                    ) : (
+                      <span className="badge-untrained">
+                        <Info size={13} /> โปรเจกต์ <strong>{selectedPlayProject.name}</strong> ยังไม่ได้ฝึก (ไม่มี Q-Table ในหน่วยความจำ) —
+                        <button
+                          className="link-button"
+                          onClick={() => {
+                            handleSelectProject(selectedPlayProject.id);
+                            setPage("training");
+                          }}
+                        >
+                          กดที่นี่เพื่อไปหน้า AI Training เพื่อฝึกโมเดลก่อน <ArrowRight size={11} />
+                        </button>
+                      </span>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
 
             <div className="game-layout">
               <div className="game-board">
@@ -638,7 +783,7 @@ export default function App() {
                       <div className={`seat-panel ${game.currentTurn === "ai" && game.phase === "player" ? "seat-active seat-turn-ai" : ""}`}>
                         <div className="seat-header">
                           <div>
-                            <strong>คู่แข่ง: {opponent === "baseline" ? "Baseline AI" : opponent === "thinking" ? "Thinking AI" : "Project AI"}</strong>
+                            <strong>คู่แข่ง: {opponent === "baseline" ? "Baseline AI" : opponent === "thinking" ? "Thinking AI" : `Project (${selectedPlayProject?.name ?? "Project AI"})`}</strong>
                             <span style={{ display: "block", fontSize: 10, color: "#888" }}>เครดิต: {game.aiBankroll.toLocaleString()} CR</span>
                           </div>
                           <span className={`seat-tag ${game.currentTurn === "ai" && game.phase === "player" ? "ai-active" : ""}`}>
@@ -741,7 +886,7 @@ export default function App() {
                 <span className="eyebrow">MATCH INFO</span>
                 <h3>สถานะการดวล</h3>
                 <div className="setting-row"><span>โหมดการเล่น</span><strong>{game.playMode === "duel" ? "Arena Duel (สลับตา)" : "Solo"}</strong></div>
-                <div className="setting-row"><span>คู่แข่ง AI</span><strong>{opponent === "baseline" ? "Baseline AI" : opponent === "thinking" ? "Thinking AI" : "Project AI"}</strong></div>
+                <div className="setting-row"><span>คู่แข่ง AI</span><strong>{opponent === "baseline" ? "Baseline AI" : opponent === "thinking" ? "Thinking AI" : `Project (${selectedPlayProject?.name})`}</strong></div>
                 <div className="setting-row"><span>กติกา</span><strong>6 สำรับ · Dealer S17</strong></div>
                 <div className="setting-row"><span>Blackjack Pay</span><strong>3:2</strong></div>
                 <div className="setting-row"><span>ผลการดวลรวม</span><strong>{duelStats.playerWins}W - {duelStats.aiWins}L - {duelStats.ties}D</strong></div>
@@ -915,12 +1060,29 @@ export default function App() {
                   disabled={!activeTrainingId || trainingRunning}
                   onClick={() => {
                     const p = projects.find(x => x.id === activeTrainingId);
-                    if (p) beginTraining({ ...p, minutes: trainMinutes });
+                    if (p) beginTraining({ ...p, minutes: trainMinutes }, true);
                   }}
                 >
-                  <Play size={15} /> เริ่มฝึกตามเวลาที่กำหนด ({trainMinutes} นาที)
+                  <Play size={15} />
+                  {activeProject && activeProject.games > 0
+                    ? `ฝึกสะสมต่ออีก ${trainMinutes} นาที (สะสมต่อจาก ${activeProject.games.toLocaleString()} มือเดิม)`
+                    : `เริ่มฝึกตามเวลาที่กำหนด (${trainMinutes} นาที)`}
                 </button>
-                <button className="outline-full" onClick={() => { setShowNewProject(true); setPage("projects"); }}>
+                {activeProject && activeProject.games > 0 && (
+                  <button
+                    className="outline-full"
+                    style={{ marginTop: 6 }}
+                    disabled={trainingRunning}
+                    onClick={() => {
+                      if (window.confirm(`ต้องการล้างความรู้เดิมของ ${activeProject.name} และเริ่มฝึกใหม่จากศูนย์หรือไม่?`)) {
+                        beginTraining({ ...activeProject, minutes: trainMinutes, games: 0, qTable: {} }, false);
+                      }
+                    }}
+                  >
+                    <RotateCcw size={13} /> รีเซ็ตความรู้เดิม (เริ่มฝึกใหม่จาก 0)
+                  </button>
+                )}
+                <button className="outline-full" style={{ marginTop: 6 }} onClick={() => { setShowNewProject(true); setPage("projects"); }}>
                   <Plus size={15} /> สร้างโปรเจกต์ใหม่
                 </button>
               </div>
@@ -972,6 +1134,19 @@ export default function App() {
                     รีเซ็ต
                   </button>
                 </div>
+                {activeProject && activeProject.games > 0 && (
+                  <button
+                    className="primary-action full-action"
+                    style={{ marginTop: 10 }}
+                    onClick={() => {
+                      setSelectedPlayProjectId(activeProject.id);
+                      setOpponent("project");
+                      setPage("play");
+                    }}
+                  >
+                    <Swords size={15} /> นำโมเดล {activeProject.name} ไปลงแข่งใน Arena ทันที
+                  </button>
+                )}
 
                 <div className="notice">
                   <Info size={15} />
@@ -1105,6 +1280,17 @@ export default function App() {
                   </div>
                   <div className="project-actions">
                     <button
+                      className="outline-action"
+                      title="เลือกโมเดลนี้และไปลงแข่งใน Arena ทันที"
+                      onClick={() => {
+                        setSelectedPlayProjectId(p.id);
+                        setOpponent("project");
+                        setPage("play");
+                      }}
+                    >
+                      <Swords size={13} /> แข่งใน Arena
+                    </button>
+                    <button
                       className="secondary-action"
                       onClick={() => {
                         handleSelectProject(p.id);
@@ -1223,7 +1409,58 @@ export default function App() {
             </div>
           </section>
         )}
+        </>
+        )}
       </main>
+
+      {/* Game Selector Modal */}
+      {showGameModal && (
+        <div className="game-modal-overlay" onClick={() => setShowGameModal(false)}>
+          <div className="game-modal" onClick={e => e.stopPropagation()}>
+            <div className="game-modal-header">
+              <div>
+                <span className="eyebrow">ARENA GAME SELECTOR</span>
+                <h3 style={{ margin: "4px 0 0", fontSize: 16 }}>เลือกเกมที่ต้องการเล่น</h3>
+              </div>
+              <button className="top-icon" onClick={() => setShowGameModal(false)}>✕</button>
+            </div>
+            <div className="game-modal-body">
+              <div
+                className={`game-card-pick ${activeGame === "blackjack" ? "active" : ""}`}
+                onClick={() => {
+                  setActiveGame("blackjack");
+                  setShowGameModal(false);
+                }}
+              >
+                <span className="pick-badge">{activeGame === "blackjack" ? "กำลังเล่นอยู่" : "พร้อมใช้งาน"}</span>
+                <div className="game-icon">♠</div>
+                <h3>Blackjack AI Arena</h3>
+                <p>เกมไพ่ 21 แต้มคาสิโนสากล ดวลสลับตากับ AI พร้อมระบบเทรน Q-Learning และกราฟผลลัพธ์แบบเรียลไทม์</p>
+                <button className="select-btn">
+                  {activeGame === "blackjack" ? "เล่นเกมนี้อยู่ (คลิกเพื่อปิด)" : "เลือกเล่น Blackjack"} <ArrowRight size={13} />
+                </button>
+              </div>
+
+              <div
+                className={`game-card-pick ${activeGame === "chess" ? "active" : ""}`}
+                onClick={() => {
+                  setActiveGame("chess");
+                  setShowGameModal(false);
+                }}
+              >
+                <span className="pick-badge">{activeGame === "chess" ? "กำลังเล่นอยู่" : "พร้อมใช้งาน"}</span>
+                <div className="game-icon">♞</div>
+                <h3>Chess AI Arena (หมากรุก)</h3>
+                <p>กระดานหมากรุกสากล 8x8 สลับตาเดินกับ Minimax Chess AI พร้อมระบบ Thought Reasoning และบันทึกประวัติการเดิน</p>
+                <button className="select-btn">
+                  {activeGame === "chess" ? "เล่นเกมนี้อยู่ (คลิกเพื่อปิด)" : "เลือกเล่น Chess"} <ArrowRight size={13} />
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
+

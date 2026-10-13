@@ -81,6 +81,31 @@ describe("Arena Duel Alternating Turns", () => {
       expect(afterAi.roundMessage).toContain("สลับมาที่ตาของคุณแล้ว");
     }
   });
+
+  it("increments turnStep on each action and allows multiple consecutive AI actions when player stood", () => {
+    let state = newGame(() => 0.3, "play", "duel");
+    state = startRound(state, 50);
+    if (state.phase === "player") {
+      const initialStep = state.turnStep;
+      // Player stands
+      state = applyAction(state, "stand");
+      expect(state.turnStep).toBeGreaterThan(initialStep);
+      expect(state.currentTurn).toBe("ai");
+
+      // AI hits
+      const step1 = state.turnStep;
+      state = applyAiAction(state, "hit", "AI hits");
+      expect(state.turnStep).toBeGreaterThan(step1);
+
+      if (!state.aiHand?.stood && !state.aiHand?.busted) {
+        expect(state.currentTurn).toBe("ai");
+        const step2 = state.turnStep;
+        state = applyAiAction(state, "stand", "AI stands");
+        expect(state.turnStep).toBeGreaterThan(step2);
+        expect(state.phase).toBe("over");
+      }
+    }
+  });
 });
 
 describe("Real Q-Learning Training Simulator", () => {
@@ -113,6 +138,17 @@ describe("AI Agent Decisions", () => {
       const decision = getAiDecision(state, "thinking");
       expect(["hit", "stand", "double"]).toContain(decision.action);
       expect(decision.thought.length).toBeGreaterThan(5);
+    }
+  });
+
+  it("uses trained Q-Table when opponent is project", () => {
+    const state = startRound(newGame(() => 0.4, "play", "duel"), 50);
+    if (state.aiHand) {
+      const qTable = createQTable();
+      trainBatch(qTable, 200, 0.1, 0.95, 0.1, "qlearning");
+      const decision = getAiDecision(state, "project", qTable);
+      expect(["hit", "stand", "double"]).toContain(decision.action);
+      expect(decision.thought).toContain("Trained Q-Agent");
     }
   });
 });
