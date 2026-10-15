@@ -45,6 +45,8 @@ export interface TTTTrainingProject {
   status: "Ready" | "Training" | "Complete";
   progress: number;
   games: number;
+  elapsedSeconds: number;
+  metricHistory: TTTMetricPoint[];
   created: string;
   algorithm: TTTAlgorithm;
   qTable: TTTQTable;
@@ -85,6 +87,8 @@ export const initialTTTProjects: TTTTrainingProject[] = [
     status: "Ready",
     progress: 0,
     games: 0,
+    elapsedSeconds: 0,
+    metricHistory: [],
     created: "โมเดลตั้งต้น เรียนจากการเล่นกับตัวเอง",
     algorithm: "selfplay-rl",
     qTable: {},
@@ -100,6 +104,8 @@ export const initialTTTProjects: TTTTrainingProject[] = [
     status: "Ready",
     progress: 0,
     games: 0,
+    elapsedSeconds: 0,
+    metricHistory: [],
     created: "เรียนเลียนครู Minimax แบบครูแพ้ไม่ได้",
     algorithm: "minimax-teacher",
     qTable: {},
@@ -162,7 +168,7 @@ function runOneGame(
   table: TTTQTable,
   epsilon: number,
   algorithm: TTTAlgorithm
-): { reward: number; oTrace: MoveTrace[]; xTrace: MoveTrace[] } {
+): { reward: number; outcome: "win" | "loss" | "draw"; oTrace: MoveTrace[]; xTrace: MoveTrace[] } {
   const board: TTTBoard = Array(9).fill("") as TTTBoard;
   const oTrace: MoveTrace[] = [];
   const xTrace: MoveTrace[] = [];
@@ -204,7 +210,8 @@ function runOneGame(
   const w = lineWinner(board);
   // Reward คิดมุมมองโมเดล (ฝ่าย O)
   const reward = w === "O" ? 1.0 : w === "X" ? -1.0 : 0.5;
-  return { reward, oTrace, xTrace };
+  const outcome = w === "O" ? "win" : w === "X" ? "loss" : "draw";
+  return { reward, outcome, oTrace, xTrace };
 }
 
 /** Tabular Monte-Carlo update walking the trace backwards with discount. */
@@ -244,10 +251,10 @@ export function trainTTTBatch(
   let totalReward = 0;
 
   for (let i = 0; i < batchGames; i++) {
-    const { reward, oTrace, xTrace } = runOneGame(table, epsilon, algorithm);
+    const { reward, outcome, oTrace, xTrace } = runOneGame(table, epsilon, algorithm);
     totalReward += reward;
-    if (reward > 0) wins++;
-    else if (reward < 0) losses++;
+    if (outcome === "win") wins++;
+    else if (outcome === "loss") losses++;
     else draws++;
 
     // โมเดล (O) เรียนรู้เสมอ

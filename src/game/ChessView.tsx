@@ -2,7 +2,7 @@ import { useEffect, useState, useMemo, useRef, useCallback } from "react";
 import {
   ArrowRight, BookOpen, BrainCircuit, CheckCircle2,
   Cpu, RotateCcw, ShieldCheck, Sparkles, Swords, Trophy,
-  Gauge, Cloud, FolderKanban, Play, Pause, Plus,
+  Gauge, FolderKanban, Play, Pause, Plus,
   Clock3, Info, Trash2, Maximize2, Minimize2, Undo2
 } from "lucide-react";
 import {
@@ -12,13 +12,14 @@ import {
   undoChessMove
 } from "./chessEngine";
 import {
-  ChessTrainingProject, ChessMetricPoint, initialChessProjects,
-  trainChessBatch, ChessAlgorithm, ChessEngineMode,
+  ChessTrainingProject, ChessMetricPoint, ChessBatchResult, initialChessProjects,
+  ChessAlgorithm, ChessTrainingDevice,
   DeepExploreState, initDeepExplore, stepDeepExplore, stepDeepExploreHeadlessBatch,
   isDeepExploreSnapshot, reviveDeepExplore
 } from "./chessTraining";
 import { detectGpuHardware, GpuDeviceInfo, dispatchGpuBatchEvaluation } from "./gpuAccelerator";
 import { loadStoredData, saveStoredData, clearStoredData, isProjectRecordArray, deepExploreKey, STORAGE_KEYS } from "./persistence";
+import ProjectCreateModal, { TRAINING_BATCH_OPTIONS, TRAINING_DURATION_OPTIONS } from "./ProjectCreateModal";
 
 const PIECE_SYMBOLS: Record<PieceColor, Record<PieceType, string>> = {
   w: { k: "♔", q: "♕", r: "♖", b: "♗", n: "♘", p: "♙" },
@@ -49,11 +50,19 @@ function restoreChessProjects(): ChessTrainingProject[] {
   if (!saved) {
     return initialChessProjects;
   }
-  return saved.map(p => ({
-    ...p,
-    status: p.status === "Training" ? ("Ready" as const) : p.status,
-    weights: { ...DEFAULT_CHESS_WEIGHTS, ...(p.weights ?? {}) }
-  }));
+  return saved.map(p => {
+    const project = { ...p } as ChessTrainingProject & { engineMode?: unknown };
+    delete project.engineMode;
+    return {
+      ...project,
+      status: p.status === "Training" ? ("Ready" as const) : p.status,
+      trainMode: p.trainMode === "deepexplore" ? "deepexplore" as const : "standard" as const,
+      trainingDevice: p.trainingDevice === "gpu" ? "gpu" as const : "cpu" as const,
+      elapsedSeconds: typeof p.elapsedSeconds === "number" ? p.elapsedSeconds : 0,
+      metricHistory: Array.isArray(p.metricHistory) ? p.metricHistory : [],
+      weights: { ...DEFAULT_CHESS_WEIGHTS, ...(p.weights ?? {}) }
+    };
+  });
 }
 
 type ChessOpponent = "baseline" | "thinking" | "master" | "project";
@@ -87,30 +96,22 @@ export default function ChessView({
   const [newProjectMode, setNewProjectMode] = useState<"standard" | "deepexplore">("standard");
 
   // Training Execution State
-  const [trainMinutes, setTrainMinutes] = useState(1);
+  const [trainMinutes, setTrainMinutes] = useState(() => chessProjects[0]?.minutes ?? 1);
   const [trainingRunning, setTrainingRunning] = useState(false);
-  const [trainingSeconds, setTrainingSeconds] = useState(0);
+  const [trainingSeconds, setTrainingSeconds] = useState(() => chessProjects[0]?.elapsedSeconds ?? 0);
   const [trainingStartedAt, setTrainingStartedAt] = useState<number | null>(null);
-  const [trainingBaseSeconds, setTrainingBaseSeconds] = useState(0);
+  const [trainingBaseSeconds, setTrainingBaseSeconds] = useState(() => chessProjects[0]?.elapsedSeconds ?? 0);
 
   // Training Config & Hyperparameters
-  const [engineMode, setEngineMode] = useState<ChessEngineMode>("local");
-  const [trainingDevice, setTrainingDevice] = useState<"auto" | "cpu" | "gpu">("auto");
+  const [trainingDevice, setTrainingDevice] = useState<ChessTrainingDevice>(() => chessProjects[0]?.trainingDevice ?? "cpu");
   const [trainingAlgorithm, setTrainingAlgorithm] = useState<ChessAlgorithm>("selfplay-rl");
   const [learningRate, setLearningRate] = useState(0.1);
   const [discountFactor, setDiscountFactor] = useState(0.95);
   const [explorationRate, setExplorationRate] = useState(0.25);
   const [batchSize, setBatchSize] = useState(100);
 
-  // Cloud AI API State
-  const [apiProvider, setApiProvider] = useState("google");
-  const [googleApiKey, setGoogleApiKey] = useState("");
-  const [showApiKey, setShowApiKey] = useState(false);
-  const [apiModel, setApiModel] = useState("gemini-2.5-flash");
-  const [apiTestStatus, setApiTestStatus] = useState<string | null>(null);
-
   // Real Real-time SVG Metric Chart
-  const [metricHistory, setMetricHistory] = useState<ChessMetricPoint[]>([]);
+  const [metricHistory, setMetricHistory] = useState<ChessMetricPoint[]>(() => chessProjects[0]?.metricHistory ?? []);
   const [chartView, setChartView] = useState<"winrate" | "reward" | "epsilon">("winrate");
 
   // Training Sub-modes: โหมดการฝึกยึดตาม "ประเภทโปรเจกต์" ที่เลือก (แยกกันแน่นอน)
@@ -133,25 +134,57 @@ export default function ChessView({
     return initDeepExplore();
   });
   const [deepExploreSpeedMs, setDeepExploreSpeedMs] = useState<number>(450); // visual move interval ms
-  const [gpuInfo, setGpuInfo] = useState<GpuDeviceInfo>(() => detectGpuHardware());
+  const [gpuInfo] = useState<GpuDeviceInfo>(() => detectGpuHardware());
+  const [trainingError, setTrainingError] = useState<string | null>(null);
+  const chessProjectsRef = useRef(chessProjects);
+  const deepExploreRef = useRef(deepExplore);
+  const deepExploreProjectIdRef = useRef(deepExploreProjectId);
+  chessProjectsRef.current = chessProjects;
+  deepExploreRef.current = deepExplore;
+  deepExploreProjectIdRef.current = deepExploreProjectId;
+
+  function updateChessProjects(update: (projects: ChessTrainingProject[]) => ChessTrainingProject[]) {
+    const updated = update(chessProjectsRef.current);
+    chessProjectsRef.current = updated;
+    setChessProjects(updated);
+  }
 
   // Web Worker refs for headless parallel computation
   const workerRef = useRef<Worker | null>(null);
   const workerBusyRef = useRef<boolean>(false); // true = worker is currently computing a batch
+  const trainingBatchWorkerRef = useRef<Worker | null>(null);
+
+  useEffect(() => () => {
+    trainingBatchWorkerRef.current?.terminate();
+    trainingBatchWorkerRef.current = null;
+  }, []);
 
   const totalTrainingSeconds = trainMinutes * 60;
+  const trainingDurationRef = useRef(totalTrainingSeconds);
+  trainingDurationRef.current = totalTrainingSeconds;
   const activeProject = useMemo(() => chessProjects.find(p => p.id === activeTrainingId) ?? chessProjects[0], [chessProjects, activeTrainingId]);
   const selectedPlayProject = useMemo(() => chessProjects.find(p => p.id === selectedPlayProjectId) ?? chessProjects[0], [chessProjects, selectedPlayProjectId]);
 
-  // Persist every project change (trained weights included) to localStorage
-  // with a trailing debounce so frequent training updates don't rewrite
-  // storage on every tick — the final state is always saved.
+  // Persist game-specific project and exploration snapshots, including partial runs.
   useEffect(() => {
-    const saveTimer = window.setTimeout(() => {
-      saveStoredData(STORAGE_KEYS.chessProjects, chessProjects);
-    }, 500);
-    return () => window.clearTimeout(saveTimer);
-  }, [chessProjects]);
+    const persist = () => {
+      saveStoredData(STORAGE_KEYS.chessProjects, chessProjectsRef.current);
+      const projectId = deepExploreProjectIdRef.current;
+      if (projectId !== null) {
+        saveStoredData(deepExploreKey(projectId), { ...deepExploreRef.current, paused: true });
+      }
+    };
+    persist();
+    const saveTimer = window.setInterval(persist, 2000);
+    window.addEventListener("pagehide", persist);
+    document.addEventListener("visibilitychange", persist);
+    return () => {
+      window.clearInterval(saveTimer);
+      window.removeEventListener("pagehide", persist);
+      document.removeEventListener("visibilitychange", persist);
+      persist();
+    };
+  }, []);
 
   // บันทึกสถานะ Deep Exploration แบบ "เฉพาะโปรเจกต์ตัวเอง" ลง slot ของมัน
   // (ไม่ปนกับข้อมูลเทรนมาตรฐานหรือโปรเจกต์อื่น) — บังคับ paused=true ตอนเซฟ
@@ -164,13 +197,34 @@ export default function ChessView({
     return () => window.clearTimeout(saveTimer);
   }, [deepExplore, deepExploreProjectId]);
 
+  useEffect(() => {
+    if (deepExploreProjectId === null) return;
+    updateChessProjects(previous => previous.map(project => {
+      if (project.id !== deepExploreProjectId) return project;
+      if (
+        project.games === deepExplore.totalGamesPlayed &&
+        project.winRate === deepExplore.winRate &&
+        project.weights.centerBonus === deepExplore.weights.centerBonus
+      ) return project;
+      return {
+        ...project,
+        games: deepExplore.totalGamesPlayed,
+        weights: { ...deepExplore.weights },
+        winRate: deepExplore.winRate
+      };
+    }));
+  }, [deepExploreProjectId, deepExplore.totalGamesPlayed, deepExplore.winRate, deepExplore.weights]);
+
   // ─── Helper: dispatch GPU work from main thread while worker computes board ───
   const fireGpuDispatch = useCallback((state: DeepExploreState, batchSize: number) => {
-    if (state.hardwareAccelerator === "gpu" || state.hardwareAccelerator === "auto") {
+    if (state.hardwareAccelerator === "gpu") {
       try {
-        dispatchGpuBatchEvaluation(batchSize, state.weights.centerBonus);
-      } catch {
-        // WebGL not available — ignore
+        if (dispatchGpuBatchEvaluation(batchSize, state.weights.centerBonus) === 0) {
+          throw new Error("GPU acceleration could not initialize a WebGL compute context.");
+        }
+      } catch (error) {
+        console.error("[chess-deep-explore] GPU batch failed:", error);
+        setTrainingError("GPU ใช้งานไม่ได้ในเซสชันนี้; CPU ยังคงสำรวจหมากต่อ");
       }
     }
   }, []);
@@ -239,25 +293,8 @@ export default function ChessView({
           worker.postMessage({ type: "step_batch", state: deepExplore, count: batchSize });
         }
 
-        // Continuous GPU pump: keep feeding shaders while worker crunching moves
-        let gpuPumpActive = true;
-        const pumpGpu = () => {
-          if (!gpuPumpActive) return;
-          if (deepExplore.hardwareAccelerator === "gpu" || deepExplore.hardwareAccelerator === "auto") {
-            try {
-              dispatchGpuBatchEvaluation(batchSize, 30);
-            } catch {
-              // ignore
-            }
-          }
-          requestAnimationFrame(pumpGpu);
-        };
-        const gpuRafId = requestAnimationFrame(pumpGpu);
-
-        // Cleanup: terminate the worker and GPU pump when effect re-runs or unmounts
+        // Cleanup: terminate the worker when effect re-runs or unmounts
         return () => {
-          gpuPumpActive = false;
-          cancelAnimationFrame(gpuRafId);
           if (workerRef.current) {
             workerRef.current.terminate();
             workerRef.current = null;
@@ -320,7 +357,7 @@ export default function ChessView({
     }
   }, [chess.turn, chess.isCheckmate, chess.isStalemate, chess.moveHistory.length, chessOpponent, selectedPlayProject]);
 
-  // Wall-Clock Timer and Real Self-Play Training Simulation Loop
+  // Wall-clock timer; actual chess games are calculated off the UI thread.
   useEffect(() => {
     if (!trainingRunning || !activeTrainingId || trainingStartedAt === null) return;
     // โปรเจกต์ Deep Exploration ห้ามโดน batch เทรนมาตรฐานปั๊มข้อมูล
@@ -333,25 +370,69 @@ export default function ChessView({
       const next = Math.min(elapsed, limit);
       setTrainingSeconds(next);
 
-      // Run real batch simulation
+      if (trainingBatchWorkerRef.current) return;
+      if (typeof Worker === "undefined") {
+        setTrainingError("Web Worker ไม่พร้อมใช้งาน จึงไม่สามารถเริ่มจำลองเกมหมากรุกโดยไม่บล็อกหน้าจอได้");
+        setTrainingRunning(false);
+        setTrainingStartedAt(null);
+        setTrainingBaseSeconds(next);
+        updateChessProjects(old => old.map(project => project.id === activeTrainingId
+          ? { ...project, status: "Ready", elapsedSeconds: next, progress: Math.min(100, next / Math.max(1, limit) * 100) }
+          : project));
+        return;
+      }
+
       const currentWeights = activeProject?.weights ? { ...activeProject.weights } : { ...DEFAULT_CHESS_WEIGHTS };
-      const lastEpsilon = metricHistory.length > 0 ? metricHistory[metricHistory.length - 1].epsilon : explorationRate;
+      if (activeProject?.trainingDevice === "gpu") {
+        try {
+          if (dispatchGpuBatchEvaluation(batchSize, currentWeights.centerBonus) === 0) {
+            throw new Error("GPU acceleration could not initialize a WebGL compute context.");
+          }
+        } catch (error) {
+          console.error("[chess-training] GPU batch failed:", error);
+          setTrainingError("เริ่มคำนวณด้วย GPU ไม่สำเร็จ การฝึกหยุดไว้และบันทึกความคืบหน้าแล้ว");
+          setTrainingRunning(false);
+          setTrainingStartedAt(null);
+          setTrainingBaseSeconds(next);
+          updateChessProjects(old => old.map(p => p.id === activeTrainingId
+            ? { ...p, status: "Ready", elapsedSeconds: next, progress: Math.min(100, next / Math.max(1, limit) * 100) }
+            : p));
+          return;
+        }
+      }
+      const previousMetrics = activeProject?.metricHistory ?? metricHistory;
+      const lastEpsilon = previousMetrics.length > 0 ? previousMetrics[previousMetrics.length - 1].epsilon : explorationRate;
 
-      const batchResult = trainChessBatch(
-        currentWeights,
-        batchSize,
-        learningRate,
-        discountFactor,
-        lastEpsilon,
-        trainingAlgorithm
-      );
+      const worker = new Worker(new URL("./chessWorker.ts", import.meta.url), { type: "module" });
+      trainingBatchWorkerRef.current = worker;
+      worker.onmessage = (event: MessageEvent<{ type: string; result?: ChessBatchResult }>) => {
+        if (trainingBatchWorkerRef.current !== worker) return;
+        trainingBatchWorkerRef.current = null;
+        worker.terminate();
+        if (event.data.type !== "training_batch_done" || !event.data.result) {
+          setTrainingError("ตัวประมวลผลหมากรุกส่งผลลัพธ์การฝึกกลับมาไม่ถูกต้อง");
+          setTrainingRunning(false);
+          setTrainingStartedAt(null);
+          const currentLimit = trainingDurationRef.current;
+          const completedElapsed = Math.min(currentLimit, trainingBaseSeconds + Math.floor((Date.now() - trainingStartedAt) / 1000));
+          setTrainingBaseSeconds(completedElapsed);
+          setTrainingSeconds(completedElapsed);
+          updateChessProjects(old => old.map(project => project.id === activeTrainingId
+            ? { ...project, status: "Ready", elapsedSeconds: completedElapsed, progress: Math.min(100, completedElapsed / Math.max(1, currentLimit) * 100) }
+            : project));
+          return;
+        }
 
-      // Save real metric point
-      setMetricHistory(prev => {
+        const batchResult = event.data.result;
+        const currentLimit = trainingDurationRef.current;
+        const completedElapsed = Math.min(
+          currentLimit,
+          trainingBaseSeconds + Math.floor((Date.now() - trainingStartedAt) / 1000)
+        );
         const point: ChessMetricPoint = {
-          step: prev.length + 1,
-          timeSeconds: next,
-          totalGames: (prev[prev.length - 1]?.totalGames ?? 0) + batchSize,
+          step: previousMetrics.length + 1,
+          timeSeconds: completedElapsed,
+          totalGames: (previousMetrics[previousMetrics.length - 1]?.totalGames ?? 0) + batchResult.batchGames,
           winRate: Number(batchResult.winRate.toFixed(1)),
           lossRate: Number(batchResult.lossRate.toFixed(1)),
           drawRate: Number(batchResult.drawRate.toFixed(1)),
@@ -359,35 +440,64 @@ export default function ChessView({
           materialAdv: Number(batchResult.materialAdv.toFixed(2)),
           epsilon: Number(batchResult.updatedEpsilon.toFixed(3))
         };
-        return [...prev, point];
-      });
+        const updatedMetrics = [...previousMetrics, point];
+        setTrainingSeconds(completedElapsed);
+        setMetricHistory(updatedMetrics);
+        updateChessProjects(old => old.map(project => project.id !== activeTrainingId
+          ? project
+          : {
+              ...project,
+              games: project.games + batchResult.batchGames,
+              weights: batchResult.updatedWeights,
+              winRate: Number(batchResult.winRate.toFixed(1)),
+              elapsedSeconds: completedElapsed,
+              metricHistory: updatedMetrics,
+              status: completedElapsed >= currentLimit ? "Complete" : "Training",
+              progress: Math.min(100, completedElapsed / Math.max(1, currentLimit) * 100)
+            }));
 
-      // Update project state with actual weights and simulated games
-      setChessProjects(old => old.map(p => {
-        if (p.id !== activeTrainingId) return p;
-        const newGames = p.games + batchSize;
-        return {
-          ...p,
-          games: newGames,
-          weights: batchResult.updatedWeights,
-          winRate: Number(batchResult.winRate.toFixed(1)),
-          status: next >= limit ? "Complete" : "Training",
-          progress: Math.min(100, (next / Math.max(1, limit)) * 100)
-        };
-      }));
-
-      if (next >= limit) {
+        if (completedElapsed >= currentLimit) {
+          setTrainingRunning(false);
+          setTrainingStartedAt(null);
+          setTrainingBaseSeconds(currentLimit);
+        }
+      };
+      worker.onerror = (event: ErrorEvent) => {
+        if (trainingBatchWorkerRef.current !== worker) return;
+        trainingBatchWorkerRef.current = null;
+        worker.terminate();
+        console.error("[chess-training] Worker failed:", event.message);
+        setTrainingError(`การจำลองเกมหมากรุกล้มเหลว: ${event.message || "เกิดข้อผิดพลาดใน Web Worker"}`);
         setTrainingRunning(false);
         setTrainingStartedAt(null);
-        setTrainingBaseSeconds(limit);
-      }
+        const currentLimit = trainingDurationRef.current;
+        const completedElapsed = Math.min(currentLimit, trainingBaseSeconds + Math.floor((Date.now() - trainingStartedAt) / 1000));
+        setTrainingSeconds(completedElapsed);
+        setTrainingBaseSeconds(completedElapsed);
+        updateChessProjects(old => old.map(project => project.id === activeTrainingId
+          ? { ...project, status: "Ready", elapsedSeconds: completedElapsed, progress: Math.min(100, completedElapsed / Math.max(1, currentLimit) * 100) }
+          : project));
+      };
+      worker.postMessage({
+        type: "train_batch",
+        weights: currentWeights,
+        batchGames: batchSize,
+        learningRate,
+        discountFactor,
+        epsilon: lastEpsilon,
+        algorithm: activeProject?.algorithm ?? trainingAlgorithm
+      });
     }, 500);
 
-    return () => window.clearInterval(timer);
+    return () => {
+      window.clearInterval(timer);
+    };
   }, [
     trainingRunning, activeTrainingId, trainingStartedAt, trainingBaseSeconds,
     totalTrainingSeconds, batchSize, learningRate, discountFactor,
-    explorationRate, trainingAlgorithm, activeProject?.weights, metricHistory, activeProject?.trainMode
+    explorationRate, trainingAlgorithm, metricHistory, activeProject?.weights,
+    activeProject?.metricHistory, activeProject?.trainingDevice,
+    activeProject?.algorithm, activeProject?.trainMode
   ]);
 
   // Legal destinations for selected square
@@ -446,21 +556,29 @@ export default function ChessView({
   function handleSelectDuration(minutes: number) {
     setTrainMinutes(minutes);
     if (activeTrainingId) {
-      setChessProjects(prev => prev.map(p => p.id === activeTrainingId ? { ...p, minutes } : p));
+      updateChessProjects(prev => prev.map(p => p.id === activeTrainingId ? { ...p, minutes } : p));
     }
   }
 
   function handleSelectProject(id: number) {
+    if (trainingRunning) pauseTraining();
     setActiveTrainingId(id);
-    const p = chessProjects.find(x => x.id === id);
+    const p = chessProjectsRef.current.find(x => x.id === id);
     if (p) {
       setTrainMinutes(p.minutes);
-      setEngineMode(p.engineMode || "local");
       setTrainingAlgorithm(p.algorithm || "selfplay-rl");
+      setTrainingDevice(p.trainingDevice);
+      setTrainingSeconds(p.elapsedSeconds);
+      setTrainingBaseSeconds(p.elapsedSeconds);
+      setMetricHistory(p.metricHistory);
       // หน้า Training ยึดโหมดตามประเภทของโปรเจกต์ที่ถูกเลือก
       const mode = p.trainMode === "deepexplore" ? "deepexplore" : "standard";
       setTrainingSubMode(mode);
       if (mode === "deepexplore") ensureDeepExploreSlot(p.id);
+    } else {
+      setTrainingSeconds(0);
+      setTrainingBaseSeconds(0);
+      setMetricHistory([]);
     }
   }
 
@@ -480,33 +598,65 @@ export default function ChessView({
       workerBusyRef.current = false;
     }
     const saved = loadStoredData<DeepExploreState>(deepExploreKey(projectId), isDeepExploreSnapshot);
-    setDeepExplore(saved ? reviveDeepExplore(saved) : initDeepExplore());
+    const projectDevice = chessProjects.find(project => project.id === projectId)?.trainingDevice ?? "cpu";
+    const slot = saved ? reviveDeepExplore(saved) : initDeepExplore();
+    setDeepExplore({
+      ...slot,
+      paused: true,
+      hardwareAccelerator: projectDevice === "gpu" ? "gpu" : "cpu"
+    });
     setDeepExploreProjectId(projectId);
-  }
-
-  /**
-   * สลับโหมดการฝึกของโปรเจกต์: บันทึกประเภทลงโปรเจกต์ปัจจุบันด้วย
-   * เพื่อให้การแยกประเภทตามโปรเจกต์เป็นข้อมูลกลางที่ถูก persist
-   */
-  function switchTrainingMode(mode: "standard" | "deepexplore") {
-    setTrainingSubMode(mode);
-    if (activeProject) {
-      const id = activeProject.id;
-      setChessProjects(prev => prev.map(p => p.id === id ? { ...p, trainMode: mode } : p));
-      if (mode === "deepexplore") {
-        pauseTraining(); // หยุดตัวจับเวลาโหมดมาตรฐานก่อนเสือมี loop วิ่งสอง
-        ensureDeepExploreSlot(id);
-      }
-    }
   }
 
   /** ใช้จากการ์ดโปรเจกต์/ลิงก์: เปิดหน้า Training ตามประเภทของโปรเจกต์นั้น */
   function openTrainingFor(project: ChessTrainingProject) {
-    setActiveTrainingId(project.id);
-    setTrainMinutes(project.minutes);
-    setTrainingSubMode(project.trainMode === "deepexplore" ? "deepexplore" : "standard");
-    if (project.trainMode === "deepexplore") ensureDeepExploreSlot(project.id);
+    if (trainingRunning) pauseTraining();
+    const selected = chessProjectsRef.current.find(item => item.id === project.id) ?? project;
+    setActiveTrainingId(selected.id);
+    setTrainMinutes(selected.minutes);
+    setTrainingDevice(selected.trainingDevice);
+    setTrainingAlgorithm(selected.algorithm);
+    setTrainingSeconds(selected.elapsedSeconds);
+    setTrainingBaseSeconds(selected.elapsedSeconds);
+    setMetricHistory(selected.metricHistory);
+    setTrainingSubMode(selected.trainMode === "deepexplore" ? "deepexplore" : "standard");
+    if (selected.trainMode === "deepexplore") ensureDeepExploreSlot(selected.id);
     setPage("training");
+  }
+
+  function handleDeleteProject(projectId: number) {
+    if (chessProjectsRef.current.length <= 1) return;
+    if (trainingRunning && activeTrainingId === projectId) pauseTraining();
+
+    const remainingProjects = chessProjectsRef.current.filter(project => project.id !== projectId);
+    const nextProject = remainingProjects[0];
+    if (activeTrainingId === projectId) {
+      setActiveTrainingId(nextProject.id);
+      setTrainMinutes(nextProject.minutes);
+      setTrainingDevice(nextProject.trainingDevice);
+      setTrainingAlgorithm(nextProject.algorithm);
+      setTrainingSeconds(nextProject.elapsedSeconds);
+      setTrainingBaseSeconds(nextProject.elapsedSeconds);
+      setMetricHistory(nextProject.metricHistory);
+      setTrainingSubMode(nextProject.trainMode === "deepexplore" ? "deepexplore" : "standard");
+    }
+
+    if (deepExploreProjectId === projectId) {
+      if (nextProject.trainMode === "deepexplore") {
+        ensureDeepExploreSlot(nextProject.id);
+      } else {
+        workerRef.current?.terminate();
+        workerRef.current = null;
+        workerBusyRef.current = false;
+        deepExploreProjectIdRef.current = null;
+        deepExploreRef.current = initDeepExplore();
+        setDeepExploreProjectId(null);
+        setDeepExplore(initDeepExplore());
+      }
+    }
+
+    clearStoredData(deepExploreKey(projectId));
+    updateChessProjects(projects => projects.filter(project => project.id !== projectId));
   }
 
   function beginTraining(project: ChessTrainingProject, resumeAccumulated: boolean = true) {
@@ -519,25 +669,28 @@ export default function ChessView({
       setPage("training");
       return;
     }
-    setChessProjects(old => old.map(p => {
+    const elapsed = resumeAccumulated ? project.elapsedSeconds : 0;
+    const history = resumeAccumulated ? project.metricHistory : [];
+    updateChessProjects(old => old.map(p => {
       if (p.id !== project.id) return p;
       return {
         ...p,
         minutes: trainMinutes,
         status: "Training",
-        progress: 0,
+        progress: Math.min(100, elapsed / Math.max(1, trainMinutes * 60) * 100),
         games: resumeAccumulated ? p.games : 0,
+        elapsedSeconds: elapsed,
+        metricHistory: history,
         weights: resumeAccumulated ? { ...p.weights } : { ...DEFAULT_CHESS_WEIGHTS }
       };
     }));
     setActiveTrainingId(project.id);
-    setTrainingSeconds(0);
-    setTrainingBaseSeconds(0);
+    setTrainingSeconds(elapsed);
+    setTrainingBaseSeconds(elapsed);
     setTrainingStartedAt(Date.now());
     setTrainingRunning(true);
-    if (!resumeAccumulated) {
-      setMetricHistory([]);
-    }
+    setMetricHistory(history);
+    setTrainingError(null);
     setPage("training");
   }
 
@@ -546,6 +699,15 @@ export default function ChessView({
       const elapsed = Math.min(totalTrainingSeconds, trainingBaseSeconds + Math.floor((Date.now() - trainingStartedAt) / 1000));
       setTrainingSeconds(elapsed);
       setTrainingBaseSeconds(elapsed);
+      if (activeTrainingId) {
+        updateChessProjects(old => old.map(p => p.id === activeTrainingId
+          ? { ...p, status: "Ready", elapsedSeconds: elapsed, progress: Math.min(100, elapsed / Math.max(1, totalTrainingSeconds) * 100) }
+          : p));
+      }
+      if (trainingBatchWorkerRef.current) {
+        trainingBatchWorkerRef.current.terminate();
+        trainingBatchWorkerRef.current = null;
+      }
     }
     setTrainingStartedAt(null);
     setTrainingRunning(false);
@@ -553,6 +715,7 @@ export default function ChessView({
 
   function resumeTraining() {
     if (!activeTrainingId) return;
+    setTrainingError(null);
     setTrainingStartedAt(Date.now());
     setTrainingRunning(true);
   }
@@ -563,13 +726,17 @@ export default function ChessView({
     setTrainingBaseSeconds(0);
     setTrainingStartedAt(null);
     setMetricHistory([]);
+    setTrainingError(null);
     if (activeTrainingId) {
-      setChessProjects(old => old.map(p => p.id === activeTrainingId ? { ...p, status: "Ready", progress: 0, games: 0 } : p));
+      updateChessProjects(old => old.map(p => p.id === activeTrainingId
+        ? { ...p, status: "Ready", progress: 0, games: 0, elapsedSeconds: 0, metricHistory: [], weights: { ...DEFAULT_CHESS_WEIGHTS } }
+        : p));
     }
   }
 
   function handleCreateProject() {
     if (!newProjectName.trim()) return;
+    if (trainingRunning) pauseTraining();
     const newId = Date.now();
     const created: ChessTrainingProject = {
       id: newId,
@@ -579,33 +746,41 @@ export default function ChessView({
       progress: 0,
       games: 0,
       created: "สร้างใหม่",
-      engineMode,
+      trainingDevice,
       algorithm: newProjectAlgo,
       weights: { ...DEFAULT_CHESS_WEIGHTS },
       winRate: 50.0,
       depth: 2,
-      trainMode: newProjectMode
+      trainMode: newProjectMode,
+      elapsedSeconds: 0,
+      metricHistory: []
     };
     if (newProjectMode === "deepexplore") {
       // โปรเจกต์ Deep Exploration ใหม่ได้ slot ของตัวเอง (ไม่รับข้อมูลเก่า)
-      saveStoredData(deepExploreKey(newId), initDeepExplore());
+      saveStoredData(deepExploreKey(newId), {
+        ...initDeepExplore(),
+        hardwareAccelerator: trainingDevice
+      });
     }
-    setChessProjects(prev => [created, ...prev]);
+    updateChessProjects(prev => [created, ...prev]);
     setActiveTrainingId(newId);
     setSelectedPlayProjectId(newId);
+    setTrainingSeconds(0);
+    setTrainingBaseSeconds(0);
+    setMetricHistory([]);
+    setTrainingAlgorithm(newProjectAlgo);
+    setTrainingSubMode(newProjectMode);
     setShowNewProject(false);
     setNewProjectName("AlphaPawn Chess");
   }
 
-  function testApiKey() {
-    if (!googleApiKey.trim()) {
-      setApiTestStatus("กรุณากรอก API Key ก่อนทดสอบ");
-      return;
-    }
-    setApiTestStatus("กำลังตรวจสอบคีย์...");
-    setTimeout(() => {
-      setApiTestStatus(`เชื่อมต่อสำเร็จ: โมเดล ${apiModel} พร้อมใช้งานบน Google AI Studio`);
-    }, 600);
+  function openNewProject() {
+    setNewProjectName("AlphaPawn Chess");
+    setNewProjectAlgo("selfplay-rl");
+    setNewProjectMode("standard");
+    setTrainingDevice("cpu");
+    setTrainMinutes(1);
+    setShowNewProject(true);
   }
 
   function fmt(seconds: number) {
@@ -655,7 +830,7 @@ export default function ChessView({
         <div style={{ textAlign: "center", padding: "40px 20px", color: "#999", background: "#fafaf8", border: "1px solid #ededeb" }}>
           <Sparkles size={24} style={{ marginBottom: 8, color: "#aaa" }} />
           <div>กด <strong>เริ่มฝึกตามเวลาที่กำหนด</strong> เพื่อสร้างข้อมูลกราฟจริงแบบ Real-time</div>
-          <small style={{ display: "block", marginTop: 4, color: "#bbb" }}>ระบบจะจำลองกระดาน Self-Play หมากรุก และพล็อตกราฟจากการเทรนจริงทันที</small>
+          <small style={{ display: "block", marginTop: 4, color: "#bbb" }}>ระบบเล่นเกมหมากรุกจริงด้วยตาเดินที่ถูกกฎหมาย แล้วพล็อตผลการเทรนทันที</small>
         </div>
       );
     }
@@ -923,11 +1098,10 @@ export default function ChessView({
                 )}
               </div>
 
-              <div style={{ display: "flex", gap: 6 }}>
+              <div className="chess-opponent-selectors">
                 <select
                   value={chessOpponent}
-                  onChange={e => setChessOpponent(e.target.value as any)}
-                  style={{ flex: 1, padding: "5px 8px", fontSize: 10, border: "1px solid var(--line)", background: "#fff" }}
+                  onChange={e => setChessOpponent(e.target.value as ChessOpponent)}
                 >
                   <option value="baseline">Baseline AI (D1)</option>
                   <option value="thinking">Thinking AI (D2)</option>
@@ -938,7 +1112,6 @@ export default function ChessView({
                   <select
                     value={selectedPlayProjectId}
                     onChange={e => setSelectedPlayProjectId(Number(e.target.value))}
-                    style={{ flex: 1, padding: "5px 8px", fontSize: 10, border: "1px solid var(--line)", background: "#fff" }}
                   >
                     {chessProjects.map(p => (
                       <option key={p.id} value={p.id}>{p.name}</option>
@@ -1288,20 +1461,12 @@ export default function ChessView({
             </div>
           </div>
 
-          {/* Sub-mode Switcher Tabs — สลับ "ประเภทโปรเจกต์" ปัจจุบัน */}
-          <div className="engine-mode-tabs" style={{ marginBottom: 18 }}>
-            <button
-              className={`engine-tab ${trainingSubMode === "deepexplore" ? "selected" : ""}`}
-              onClick={() => switchTrainingMode("deepexplore")}
-            >
-              <Sparkles size={14} /> 10¹²⁰ Deep Exploration (ตัวของตัวเอง · พัก/ทำต่อได้)
-            </button>
-            <button
-              className={`engine-tab ${trainingSubMode === "standard" ? "selected" : ""}`}
-              onClick={() => switchTrainingMode("standard")}
-            >
-              <Cpu size={14} /> Batch Self-Play RL (เทรนตามเวลา + กราฟสถิติ)
-            </button>
+          <div className="inline-note" style={{ marginBottom: 18 }}>
+            {activeProject?.trainingDevice === "gpu" ? <Gauge size={14} /> : <Cpu size={14} />}
+            <strong>วิธีเทรนของโปรเจกต์นี้ (ล็อกไว้):</strong>
+            {" "}{trainingSubMode === "deepexplore" ? "Deep Exploration" : "Batch Self-Play RL"}
+            {" · "}{activeProject?.trainingDevice.toUpperCase() ?? "CPU"}
+            {" · "}{activeProject?.algorithm ?? "selfplay-rl"}
           </div>
 
           {/* ================= MODE A: DEEP EXPLORATION THEATER (10^120) ================= */}
@@ -1345,19 +1510,17 @@ export default function ChessView({
                     </div>
                     <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, background: "#171717", padding: 12, border: "1px solid #282828", fontSize: 11, textAlign: "left" }}>
                       <div>
-                        <span style={{ color: "#777", display: "block", fontSize: 9 }}>HARDWARE ACCELERATION:</span>
+                        <span style={{ color: "#777", display: "block", fontSize: 9 }}>TRAINING DEVICE (LOCKED):</span>
                         <strong style={{ color: deepExplore.hardwareAccelerator === "gpu" ? "#74c0fc" : "#8ce99a" }}>
-                          {deepExplore.hardwareAccelerator === "gpu"
-                            ? "NVIDIA RTX 5050 GPU (Active)"
-                            : deepExplore.hardwareAccelerator === "cpu"
-                            ? "Multi-Thread CPU (100%)"
-                            : "Auto Balanced Core"}
+                          {deepExplore.hardwareAccelerator === "gpu" ? "GPU shader batches + CPU chess search" : "CPU"}
                         </strong>
                       </div>
                       <div>
                         <span style={{ color: "#777", display: "block", fontSize: 9 }}>PHYSICAL ADAPTER:</span>
                         <strong style={{ color: "#fff", fontSize: 10, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", display: "block" }}>
-                          {gpuInfo.renderer || "NVIDIA GeForce RTX 5050"}
+                          {deepExplore.hardwareAccelerator === "gpu"
+                            ? (gpuInfo.supported ? gpuInfo.renderer : "WebGL unavailable")
+                            : "CPU"}
                         </strong>
                       </div>
                       <div>
@@ -1370,7 +1533,7 @@ export default function ChessView({
                       </div>
                     </div>
                     <div style={{ marginTop: 10, padding: "7px 10px", background: deepExplore.hardwareAccelerator === "gpu" ? "rgba(116, 192, 252, 0.12)" : "rgba(255,255,255,0.05)", border: `1px solid ${deepExplore.hardwareAccelerator === "gpu" ? "#1971c2" : "#333"}`, textAlign: "left", fontSize: 9, font: "9px var(--mono)", color: deepExplore.hardwareAccelerator === "gpu" ? "#a5d8ff" : "#aaa" }}>
-                      🎮 <strong>GPU Status:</strong> {deepExplore.hardwareAccelerator === "gpu" ? `กำลังส่ง Matrix Shader Pass ไปยัง NVIDIA RTX 5050 VRAM โดยตรง` : "คลิกเลือก 'GPU RTX (Max)' ด้านล่างเพื่อบังคับใช้การ์ดจอแยก RTX 5050"}
+                      <strong>{deepExplore.hardwareAccelerator === "gpu" ? "GPU:" : "CPU:"}</strong> {deepExplore.hardwareAccelerator === "gpu" ? "GPU ประมวลผล shader batch; chess search และการอัปเดตโมเดลยังทำบน CPU" : "ใช้ Web Worker ประมวลผล chess search บน CPU"}
                     </div>
                     <p style={{ fontSize: 10, color: "#777", margin: "10px 0 0", lineHeight: 1.6 }}>
                       💡 เมื่อปิด GUI ความเร็วจะเพิ่มขึ้นมหาศาล คุณสามารถสลับกลับไปที่ปุ่ม <strong>"Visual Board"</strong> ได้ตลอดเวลาเพื่อดูกระดานภาพสด
@@ -1488,32 +1651,10 @@ export default function ChessView({
                     </button>
                   </div>
 
-                  {/* Hardware Selection (CPU / GPU / Auto) */}
+                  {/* Hardware is selected when creating the project and remains fixed. */}
                   <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 6, fontSize: 9, font: "9px var(--mono)", color: "#666" }}>
-                    <span>HARDWARE:</span>
-                    <div style={{ display: "flex", gap: 4 }}>
-                      <button
-                        className={`chart-type-btn ${deepExplore.hardwareAccelerator === "gpu" ? "active" : ""}`}
-                        style={{ padding: "4px 8px", fontSize: 9, borderColor: deepExplore.hardwareAccelerator === "gpu" ? "#1971c2" : undefined, background: deepExplore.hardwareAccelerator === "gpu" ? "#1864ab" : undefined, color: deepExplore.hardwareAccelerator === "gpu" ? "#fff" : undefined }}
-                        onClick={() => setDeepExplore(prev => ({ ...prev, hardwareAccelerator: "gpu" }))}
-                      >
-                        ⚡ NVIDIA RTX 5050 (GPU)
-                      </button>
-                      <button
-                        className={`chart-type-btn ${deepExplore.hardwareAccelerator === "cpu" ? "active" : ""}`}
-                        style={{ padding: "4px 8px", fontSize: 9 }}
-                        onClick={() => setDeepExplore(prev => ({ ...prev, hardwareAccelerator: "cpu" }))}
-                      >
-                        CPU Multi-Core
-                      </button>
-                      <button
-                        className={`chart-type-btn ${deepExplore.hardwareAccelerator === "auto" ? "active" : ""}`}
-                        style={{ padding: "4px 8px", fontSize: 9 }}
-                        onClick={() => setDeepExplore(prev => ({ ...prev, hardwareAccelerator: "auto" }))}
-                      >
-                        AUTO
-                      </button>
-                    </div>
+                    <span>HARDWARE (LOCKED):</span>
+                    <strong>{activeProject?.trainingDevice === "gpu" ? "GPU shader batches + CPU search" : "CPU"}</strong>
                   </div>
 
                   {deepExplore.computeEngine === "visual" && (
@@ -1571,11 +1712,11 @@ export default function ChessView({
                       style={{ flex: 1, fontSize: 9 }}
                       onClick={() => {
                         if (activeTrainingId) {
-                          setChessProjects(prev => prev.map(p => {
+                          updateChessProjects(prev => prev.map(p => {
                             if (p.id !== activeTrainingId) return p;
                             return {
                               ...p,
-                              games: p.games + deepExplore.totalGamesPlayed,
+                              games: deepExplore.totalGamesPlayed,
                               weights: { ...deepExplore.weights },
                               winRate: deepExplore.winRate
                             };
@@ -1623,46 +1764,15 @@ export default function ChessView({
                 ))}
               </select>
 
-              {/* Engine Mode Tabs (Local RL vs Cloud AI API) */}
-              <label className="field-label">โหมดการประมวลผล (เลือก Local CPU หรือ Cloud AI)</label>
-              <div className="engine-mode-tabs">
-                <button
-                  className={`engine-tab ${engineMode === "local" ? "selected" : ""}`}
-                  onClick={() => setEngineMode("local")}
-                >
-                  <Cpu size={14} /> Local RL (CPU/GPU Simulation)
-                </button>
-                <button
-                  className={`engine-tab ${engineMode === "api" ? "selected" : ""}`}
-                  onClick={() => setEngineMode("api")}
-                >
-                  <Cloud size={14} /> Cloud AI API (Gemini Studio)
-                </button>
+              <label className="field-label">วิธีเทรนของโปรเจกต์นี้ (เปลี่ยนไม่ได้)</label>
+              <div className="inline-note">
+                {activeProject?.trainingDevice === "gpu" ? <Gauge size={14} /> : <Cpu size={14} />}
+                {activeProject?.trainingDevice === "gpu" ? "GPU shader batches + CPU chess search" : "CPU"}
+                {" · "}{activeProject?.trainMode === "deepexplore" ? "Deep Exploration" : "Batch Self-Play RL"}
+                {" · "}{activeProject?.algorithm ?? "selfplay-rl"}
               </div>
 
-              {engineMode === "local" ? (
-                <>
-                  <label className="field-label">อุปกรณ์ประมวลผล</label>
-                  <div className="compute-options">
-                    <button className={trainingDevice === "auto" ? "selected" : ""} onClick={() => setTrainingDevice("auto")}>
-                      <Sparkles size={16} /><strong>อัตโนมัติ</strong><small>ตรวจจับฮาร์ดแวร์ที่ดีที่สุด</small>
-                    </button>
-                    <button className={trainingDevice === "cpu" ? "selected" : ""} onClick={() => setTrainingDevice("cpu")}>
-                      <Cpu size={16} /><strong>CPU</strong><small>คำนวณ Self-Play รวดเร็ว</small>
-                    </button>
-                    <button className={trainingDevice === "gpu" ? "selected" : ""} onClick={() => setTrainingDevice("gpu")}>
-                      <Gauge size={16} /><strong>GPU</strong><small>เร่งคำนวณ Position Search</small>
-                    </button>
-                  </div>
-
-                  <label className="field-label">อัลกอริทึมการเรียนรู้</label>
-                  <select value={trainingAlgorithm} onChange={e => setTrainingAlgorithm(e.target.value as any)}>
-                    <option value="selfplay-rl">Self-Play Reinforcement Learning (นโยบายเล่นกับตัวเอง)</option>
-                    <option value="td-minimax">TD-Minimax (ปรับค่าน้ำหนักตามผลลัพธ์กิ่งไม้ Minimax)</option>
-                    <option value="heuristic-distill">Tactical Distillation (เรียนรู้การแลกหมากและตำแหน่งยุทธศาสตร์)</option>
-                  </select>
-
-                  <div className="advanced-settings">
+              <div className="advanced-settings">
                     <span className="eyebrow">HYPERPARAMETERS</span>
                     <div className="range-setting">
                       <label>Learning rate (α) <strong>{learningRate.toFixed(2)}</strong></label>
@@ -1677,52 +1787,12 @@ export default function ChessView({
                       <input type="range" min="0.01" max="1" step="0.01" value={explorationRate} onChange={e => setExplorationRate(Number(e.target.value))} />
                     </div>
                   </div>
-                </>
-              ) : (
-                <div style={{ background: "#f8f8f5", padding: 12, border: "1px solid var(--line)", marginBottom: 12 }}>
-                  <p style={{ margin: "0 0 10px", fontSize: 11, color: "#666" }}>
-                    เมื่อเลือก <strong>Cloud AI API</strong> ระบบจะใช้ LLM ช่วยวิเคราะห์การประเมินตำแหน่งหมากและแนะนำการเดินหมากผ่านคลาวด์
-                  </p>
-                  <label className="field-label" style={{ marginTop: 6 }}>ผู้ให้บริการ AI</label>
-                  <select value={apiProvider} onChange={e => setApiProvider(e.target.value)}>
-                    <option value="google">Google Gemini API</option>
-                  </select>
-
-                  <label className="field-label">โมเดล</label>
-                  <select value={apiModel} onChange={e => setApiModel(e.target.value)}>
-                    <option value="gemini-2.5-flash">Gemini 2.5 Flash (ความเร็วสูง เหมาะกับเกม)</option>
-                    <option value="gemini-2.5-pro">Gemini 2.5 Pro (วิเคราะห์เชิงลึก)</option>
-                  </select>
-
-                  <label className="field-label">API Key</label>
-                  <div className="api-key-row">
-                    <input
-                      type={showApiKey ? "text" : "password"}
-                      autoComplete="off"
-                      spellCheck={false}
-                      value={googleApiKey}
-                      onChange={e => setGoogleApiKey(e.target.value)}
-                      placeholder="วาง Google AI Studio API key ที่นี่"
-                    />
-                    <button className="secondary-action" onClick={() => setShowApiKey(v => !v)}>
-                      {showApiKey ? "ซ่อน" : "แสดง"}
-                    </button>
-                    <button className="secondary-action" onClick={testApiKey}>
-                      ทดสอบ
-                    </button>
-                  </div>
-                  {apiTestStatus && (
-                    <div style={{ fontSize: 10, color: "#2d663b", marginTop: 7, display: "flex", alignItems: "center", gap: 5 }}>
-                      <CheckCircle2 size={13} /> {apiTestStatus}
-                    </div>
-                  )}
-                </div>
-              )}
+              {trainingError && <div className="inline-note" role="alert">{trainingError}</div>}
 
               {/* Duration Options */}
               <label className="field-label">ระยะเวลาฝึก (ตั้งค่าได้จริง 1-60 นาที)</label>
               <div className="duration-options">
-                {[1, 5, 10, 30, 60].map(m => (
+                {TRAINING_DURATION_OPTIONS.map(m => (
                   <button
                     key={m}
                     className={trainMinutes === m ? "selected" : ""}
@@ -1733,31 +1803,17 @@ export default function ChessView({
                 ))}
               </div>
 
-              <label className="field-label">Simulated Games ต่อ Batch</label>
+              <label className="field-label">เกมหมากรุกจริงต่อ Batch</label>
               <select value={batchSize} onChange={e => setBatchSize(Number(e.target.value))}>
-                <option value={50}>50 games / batch</option>
-                <option value={100}>100 games / batch</option>
-                <option value={200}>200 games / batch</option>
-                <option value={500}>500 games / batch</option>
+                {TRAINING_BATCH_OPTIONS.map(size => (
+                  <option key={size} value={size}>{size} games / batch</option>
+                ))}
               </select>
 
               <div className="field-help">
                 <Clock3 size={14} /> เลือก {trainMinutes} นาที = ฝึก {trainMinutes * 60} วินาทีตามจริง
               </div>
 
-              <button
-                className="primary-action full-action"
-                disabled={!activeTrainingId || trainingRunning}
-                onClick={() => {
-                  const p = chessProjects.find(x => x.id === activeTrainingId);
-                  if (p) beginTraining({ ...p, minutes: trainMinutes }, true);
-                }}
-              >
-                <Play size={15} />
-                {activeProject && activeProject.games > 0
-                  ? `ฝึกสะสมต่ออีก ${trainMinutes} นาที (สะสมต่อจาก ${activeProject.games.toLocaleString()} กระดานเดิม)`
-                  : `เริ่มฝึกตามเวลาที่กำหนด (${trainMinutes} นาที)`}
-              </button>
               {activeProject && activeProject.games > 0 && (
                 <button
                   className="outline-full"
@@ -1772,8 +1828,8 @@ export default function ChessView({
                   <RotateCcw size={13} /> รีเซ็ตความรู้เดิม (เริ่มฝึกใหม่จาก 0)
                 </button>
               )}
-              <button className="outline-full" style={{ marginTop: 6 }} onClick={() => { setShowNewProject(true); setPage("projects"); }}>
-                <Plus size={15} /> สร้างโปรเจกต์ Chess ใหม่
+              <button className="outline-full full-action project-create-trigger" onClick={openNewProject}>
+                <Plus size={15} /> สร้างโปรเจกต์ใหม่
               </button>
             </div>
 
@@ -1785,7 +1841,7 @@ export default function ChessView({
                   <h3>{activeProject?.name ?? "ยังไม่มี Training Session"}</h3>
                 </div>
                 <div className="run-status">
-                  {trainingRunning ? "SIMULATING SELF-PLAY" : activeProject?.status === "Complete" ? "COMPLETE" : "IDLE"}
+                  {trainingRunning ? "PLAYING TRAINING GAMES" : activeProject?.status === "Complete" ? "COMPLETE" : "IDLE"}
                 </div>
               </div>
 
@@ -1804,7 +1860,7 @@ export default function ChessView({
 
               <div className="metric-grid">
                 <div>
-                  <span>SIMULATED CHESS GAMES</span>
+                  <span>REAL CHESS GAMES</span>
                   <strong>{(activeProject?.games ?? 0).toLocaleString()}</strong>
                 </div>
                 <div>
@@ -1817,8 +1873,16 @@ export default function ChessView({
                 <button className="secondary-action" disabled={!trainingRunning} onClick={pauseTraining}>
                   <Pause size={14} /> พักการฝึก
                 </button>
-                <button className="primary-action" disabled={!activeTrainingId || trainingRunning || trainingSeconds >= totalTrainingSeconds} onClick={resumeTraining}>
-                  <Play size={14} /> ทำต่อ
+                <button
+                  className="primary-action"
+                  disabled={!activeTrainingId || trainingRunning || trainingSeconds >= totalTrainingSeconds}
+                  onClick={() => {
+                    if (!activeProject) return;
+                    if (trainingSeconds > 0) resumeTraining();
+                    else beginTraining({ ...activeProject, minutes: trainMinutes }, true);
+                  }}
+                >
+                  <Play size={14} /> {trainingSeconds > 0 ? "ทำต่อ" : "เริ่มฝึก"}
                 </button>
                 <button className="outline-full" onClick={resetTraining}>
                   รีเซ็ต
@@ -1842,7 +1906,7 @@ export default function ChessView({
               <div className="notice" style={{ marginTop: 18 }}>
                 <Info size={15} />
                 <span>
-                  ระหว่างที่เวลาเดิน ระบบจะจำลองกระดาน Self-Play ของโมเดลอย่างต่อเนื่อง ปรับค่าน้ำหนัก Center Bonus, Pawn Advance และพล็อตกราฟอัตราชนะด้านล่างแบบเรียลไทม์
+                  ระหว่างที่เวลาเดิน ระบบจะเล่นเกมหมากรุกจริงด้วยตาเดินที่ถูกกฎหมาย ระหว่างโมเดลกับคู่แข่งฐาน สลับสีเพื่อความสมดุล แล้วปรับค่าน้ำหนักและพล็อตกราฟอัตราชนะด้านล่าง
                 </span>
               </div>
             </div>
@@ -1912,54 +1976,10 @@ export default function ChessView({
               <h1>Your Chess AI Models</h1>
               <p className="lede">จัดการโมเดลหมากรุกที่คุณฝึกฝน ตรวจสอบค่าน้ำหนักการประเมินสถานะ และส่งไปลงสนามจริง</p>
             </div>
-            <button className="primary-action" onClick={() => setShowNewProject(v => !v)}>
-              <Plus size={15} /> {showNewProject ? "ปิดฟอร์ม" : "สร้างโปรเจกต์ Chess AI"}
+            <button className="primary-action" onClick={openNewProject}>
+              <Plus size={15} /> สร้างโปรเจกต์ใหม่
             </button>
           </div>
-
-          {/* New Project Form */}
-          {showNewProject && (
-            <div className="panel new-project" style={{ marginBottom: 20 }}>
-              <div className="panel-heading">
-                <div><span className="eyebrow">NEW MODEL</span><h3>สร้างโปรเจกต์ใหม่</h3></div>
-                <FolderKanban size={18} />
-              </div>
-              <label className="field-label">ชื่อโมเดล</label>
-              <input
-                type="text"
-                value={newProjectName}
-                onChange={e => setNewProjectName(e.target.value)}
-                placeholder="เช่น AlphaKnight-v2"
-              />
-
-              <label className="field-label">อัลกอริทึมเริ่มต้น</label>
-              <select value={newProjectAlgo} onChange={e => setNewProjectAlgo(e.target.value as any)}>
-                <option value="selfplay-rl">Self-Play Reinforcement Learning</option>
-                <option value="td-minimax">TD-Minimax (Depth Evaluation)</option>
-                <option value="heuristic-distill">Tactical Distillation</option>
-              </select>
-
-              <label className="field-label">ประเภทโปรเจกต์ (โหมดฝึกของโปรเจกต์นี้ — แต่ละแบบบันทึกข้อมูลของตัวเองแยกกัน)</label>
-              <div className="engine-mode-tabs" style={{ marginBottom: 12 }}>
-                <button
-                  className={`engine-tab ${newProjectMode === "standard" ? "selected" : ""}`}
-                  onClick={() => setNewProjectMode("standard")}
-                >
-                  <Cpu size={14} /> Self-Play RL (Batch เทรนตามเวลา)
-                </button>
-                <button
-                  className={`engine-tab ${newProjectMode === "deepexplore" ? "selected" : ""}`}
-                  onClick={() => setNewProjectMode("deepexplore")}
-                >
-                  <Sparkles size={14} /> 10¹²⁰ Deep Exploration
-                </button>
-              </div>
-
-              <button className="primary-action full-action" onClick={handleCreateProject}>
-                <Plus size={14} /> บันทึกและเริ่มโปรเจกต์
-              </button>
-            </div>
-          )}
 
           {/* Project List */}
           <div className="project-list">
@@ -1990,6 +2010,8 @@ export default function ChessView({
                   <div className="project-meta">
                     <span>PROGRESS: {Math.round(p.progress)}%</span>
                     <span>{p.minutes} MIN TARGET</span>
+                    <span>{p.trainingDevice.toUpperCase()} · {p.algorithm}</span>
+                    <span>{fmt(p.elapsedSeconds)} elapsed</span>
                   </div>
                 </div>
 
@@ -2014,11 +2036,7 @@ export default function ChessView({
                     <button
                       className="top-icon"
                       title="ลบโปรเจกต์"
-                      onClick={() => {
-                        // ลบ slot การสำรวจของโปรเจกต์ตัวนี้ด้วย เพื่อไม่ให้ข้อมูลค้างกองอยู่
-                        clearStoredData(deepExploreKey(p.id));
-                        setChessProjects(prev => prev.filter(x => x.id !== p.id));
-                      }}
+                      onClick={() => handleDeleteProject(p.id)}
                     >
                       <Trash2 size={13} />
                     </button>
@@ -2077,6 +2095,77 @@ export default function ChessView({
             เข้าสู่กระดานเล่นเกม <ArrowRight size={15} />
           </button>
         </section>
+      )}
+      {showNewProject && (page === "training" || page === "projects") && (
+        <ProjectCreateModal
+          gameName="Chess"
+          onClose={() => setShowNewProject(false)}
+          onCreate={handleCreateProject}
+        >
+          <label className="field-label" htmlFor="chess-project-name">ชื่อโมเดล</label>
+          <input
+            id="chess-project-name"
+            type="text"
+            value={newProjectName}
+            onChange={event => setNewProjectName(event.target.value)}
+            placeholder="เช่น AlphaKnight-v2"
+            required
+            autoFocus
+          />
+
+          <label className="field-label">อุปกรณ์ฝึก (ล็อกไว้กับโปรเจกต์)</label>
+          <div className="compute-options">
+            <button
+              className={trainingDevice === "cpu" ? "selected" : ""}
+              onClick={() => setTrainingDevice("cpu")}
+              type="button"
+            >
+              <Cpu size={16} /><strong>CPU</strong><small>ค้นหาและเทรนบนเครื่อง</small>
+            </button>
+            <button
+              className={trainingDevice === "gpu" ? "selected" : ""}
+              onClick={() => setTrainingDevice("gpu")}
+              disabled={!gpuInfo.supported}
+              type="button"
+            >
+              <Gauge size={16} /><strong>GPU</strong><small>{gpuInfo.supported ? "GPU shader batches + CPU chess search" : "เครื่อง/เบราว์เซอร์นี้ไม่รองรับ WebGL"}</small>
+            </button>
+          </div>
+
+          <label className="field-label">ระยะเวลาเทรน (ปรับได้ภายหลัง)</label>
+          <div className="duration-options">
+            {TRAINING_DURATION_OPTIONS.map(minutes => (
+              <button
+                key={minutes}
+                type="button"
+                className={trainMinutes === minutes ? "selected" : ""}
+                onClick={() => setTrainMinutes(minutes)}
+              >
+                {minutes < 60 ? `${minutes} น.` : "1 ชม."}
+              </button>
+            ))}
+          </div>
+
+          <label className="field-label" htmlFor="chess-project-algorithm">อัลกอริทึมเริ่มต้น</label>
+          <select
+            id="chess-project-algorithm"
+            value={newProjectAlgo}
+            onChange={event => setNewProjectAlgo(event.target.value as ChessAlgorithm)}
+          >
+            <option value="selfplay-rl">Self-Play Reinforcement Learning</option>
+            <option value="td-minimax">TD-Minimax (Depth Evaluation)</option>
+            <option value="heuristic-distill">Tactical Distillation</option>
+          </select>
+
+          <label className="field-label">ประเภทโปรเจกต์ (ล็อกไว้กับโปรเจกต์)</label>
+          <select
+            value={newProjectMode}
+            onChange={event => setNewProjectMode(event.target.value as "standard" | "deepexplore")}
+          >
+            <option value="standard">Self-Play RL (Batch training)</option>
+            <option value="deepexplore">10¹²⁰ Deep Exploration</option>
+          </select>
+        </ProjectCreateModal>
       )}
     </>
   );

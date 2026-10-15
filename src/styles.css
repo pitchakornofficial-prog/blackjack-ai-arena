@@ -40,7 +40,6 @@
 .project-ai-selector-box{background:#fff;border:1px solid var(--line);padding:14px 16px;margin-bottom:15px;display:flex;flex-direction:column;gap:10px}
 .selector-title{display:flex;align-items:center;gap:8px;font-size:11px;color:#333}
 .selector-title svg{color:#666}
-.project-ai-selector-box select{width:100%;padding:10px 12px;border:1px solid var(--line);background:#fafaf8;color:#222;font-size:11px}
 .selected-project-badge{display:flex;align-items:center;font-size:10px;padding:8px 12px;background:#f5f5f2;border:1px solid #ebebe5}
 .badge-ready{color:#2a5732;display:flex;align-items:center;gap:7px}
 .badge-ready strong{color:#1a3d21}
@@ -67,6 +66,15 @@
 .game-card-pick .select-btn{margin-top:auto;width:100%;padding:10px;background:#191919;color:#fff;border:0;font:9px var(--mono);display:flex;align-items:center;justify-content:center;gap:6px}
 .game-modal-footer{padding:15px 22px;border-top:1px solid var(--line);display:flex;justify-content:flex-end;gap:9px;background:#fafaf8}
 .game-modal-title{font-size:16px;font-weight:600;margin:4px 0 0;display:block}
+.project-create-modal{max-width:620px;max-height:90vh;display:flex;flex-direction:column}
+.project-create-modal .game-modal-header{flex:none}
+.project-modal-body{padding:22px;overflow-y:auto}
+.project-modal-body>.field-label:first-child{margin-top:0}
+.project-modal-body input[type="text"]{width:100%;min-height:40px;padding:10px 12px;border:1px solid var(--line);border-radius:3px;background:#fff;color:var(--ink);font:11px Manrope,'Noto Sans Thai',sans-serif}
+.project-modal-body .compute-options{grid-template-columns:repeat(2,minmax(0,1fr))}
+.project-create-modal .game-modal-footer{flex:none}
+.project-create-modal .game-modal-footer .ghost-button{min-height:40px}
+.project-create-trigger{width:100%;margin-top:14px}
 @media(max-width:680px){.game-modal-body.game-choice-grid{grid-template-columns:1fr}}
 
 /* Modal เลือกเกมแรก (สไตล์เก่า) */
@@ -229,7 +237,6 @@
 .deep-explore-controls { padding: 12px 16px; background: #fafaf8; display: flex; flex-direction: column; gap: 7px; }
 .deep-explore-controls .speed-row { display: flex; align-items: center; gap: 8px; font-size: 10px; }
 .deep-explore-controls .speed-row label { color: #777; font: 9px var(--mono); }
-.deep-explore-controls .speed-row select { padding: 4px 8px; border: 1px solid var(--line); font: 10px var(--mono); background: #fff; }
 .shannon-badge { display: flex; align-items: center; gap: 8px; padding: 8px 12px; background: #191919; color: #fff; font: 9px var(--mono); margin-bottom: 8px; }
 .shannon-badge .shannon-num { font-size: 16px; font-weight: 700; letter-spacing: -.02em; }
 .shannon-badge small { color: #aaa; line-height: 1.4; }
@@ -265,3 +272,10 @@
 
 .game-board .controls{padding:14px 20px}
 .side-panel .captured-box,.side-panel .move-history-card{margin-bottom:12px}
+
+select,.training-config select{appearance:none;-webkit-appearance:none;width:100%;min-height:40px;padding:10px 36px 10px 12px;border:1px solid var(--line);border-radius:3px;background:#fff url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='m1 1 5 5 5-5' fill='none' stroke='%23777770' stroke-width='1.5'/%3E%3C/svg%3E") no-repeat right 12px center;color:var(--ink);font:11px Manrope,'Noto Sans Thai',sans-serif;line-height:1.4;cursor:pointer}
+select:focus-visible{outline:2px solid #191919;outline-offset:2px}
+select:disabled{opacity:.5;cursor:not-allowed}
+select option{background:#fff;color:var(--ink)}
+.chess-opponent-selectors{display:flex;gap:6px}
+.chess-opponent-selectors select{flex:1;min-width:0}

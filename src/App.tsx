@@ -1,9 +1,9 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowLeft, ArrowRight, BrainCircuit, BookOpen, CircleHelp, Clock3, Code2,
   Cpu, FolderKanban, Gauge, House, Info, Play, Plus, RotateCcw, Settings2,
-  ShieldCheck, Sparkles, Swords, Trophy, WandSparkles, X, CheckCircle2, Cloud,
-  Eye, EyeOff, Layers, Maximize2, Minimize2, Home
+  ShieldCheck, Sparkles, Swords, Trophy, WandSparkles, X, CheckCircle2,
+  Layers, Maximize2, Minimize2, Home
 } from "lucide-react";
 import {
   Action, Card as PlayingCard, GameState, applyAction, applyAiAction,
@@ -11,6 +11,8 @@ import {
 } from "./game/engine";
 import { QTable, MetricPoint, trainBatch } from "./game/trainer";
 import { getAiDecision } from "./game/aiAgent";
+import { detectGpuHardware, dispatchGpuBatchEvaluation } from "./game/gpuAccelerator";
+import ProjectCreateModal, { TRAINING_DURATION_OPTIONS } from "./game/ProjectCreateModal";
 import ChessView from "./game/ChessView";
 import TTTView from "./game/TTTView";
 import { loadStoredData, saveStoredData, isProjectRecordArray, STORAGE_KEYS } from "./game/persistence";
@@ -19,7 +21,8 @@ type ActiveGame = "blackjack" | "chess" | "ttt" | "undecided";
 
 type Page = "home" | "play" | "training" | "projects" | "rules" | "help";
 type Opponent = "baseline" | "thinking" | "project";
-type EngineMode = "local" | "api";
+type TrainingDevice = "cpu" | "gpu";
+type TrainingAlgorithm = "qlearning" | "baseline";
 
 type TrainingProject = {
   id: number;
@@ -29,7 +32,10 @@ type TrainingProject = {
   progress: number;
   games: number;
   created: string;
-  engineMode: EngineMode;
+  trainingDevice: TrainingDevice;
+  trainingAlgorithm: TrainingAlgorithm;
+  elapsedSeconds: number;
+  metricHistory: MetricPoint[];
   qTable?: QTable;
 };
 
@@ -68,7 +74,10 @@ const initialProjects: TrainingProject[] = [
     progress: 0,
     games: 0,
     created: "ตัวอย่างโปรเจกต์",
-    engineMode: "local"
+    trainingDevice: "cpu",
+    trainingAlgorithm: "qlearning",
+    elapsedSeconds: 0,
+    metricHistory: []
   }
 ];
 
@@ -90,30 +99,35 @@ export default function App() {
     (savedBlackjackProjects ?? initialProjects).map(p => ({
       ...p,
       status: p.status === "Training" ? ("Ready" as const) : p.status,
+      trainingDevice: p.trainingDevice === "gpu" ? "gpu" as const : "cpu" as const,
+      trainingAlgorithm: p.trainingAlgorithm === "baseline" ? p.trainingAlgorithm : "qlearning",
+      elapsedSeconds: typeof p.elapsedSeconds === "number" ? p.elapsedSeconds : 0,
+      metricHistory: Array.isArray(p.metricHistory) ? p.metricHistory : [],
       qTable: p.qTable && typeof p.qTable === "object" ? p.qTable : undefined
     }))
   );
+  const projectsRef = useRef(projects);
+  projectsRef.current = projects;
+  function updateProjects(update: (current: TrainingProject[]) => TrainingProject[]) {
+    const updated = update(projectsRef.current);
+    projectsRef.current = updated;
+    setProjects(updated);
+  }
   const [projectName, setProjectName] = useState("My Blackjack Agent");
-  const [trainMinutes, setTrainMinutes] = useState(1);
-  const [activeTrainingId, setActiveTrainingId] = useState<number | null>(1);
+  const [trainMinutes, setTrainMinutes] = useState(() => projects[0]?.minutes ?? 1);
+  const [activeTrainingId, setActiveTrainingId] = useState<number | null>(() => projects[0]?.id ?? null);
   const [selectedPlayProjectId, setSelectedPlayProjectId] = useState<number | null>(1);
-  const [trainingSeconds, setTrainingSeconds] = useState(0);
+  const [trainingSeconds, setTrainingSeconds] = useState(() => projects[0]?.elapsedSeconds ?? 0);
   const [trainingRunning, setTrainingRunning] = useState(false);
   const [trainingStartedAt, setTrainingStartedAt] = useState<number | null>(null);
-  const [trainingBaseSeconds, setTrainingBaseSeconds] = useState(0);
-
-  // Engine selection (Local RL vs Cloud AI API)
-  const [engineMode, setEngineMode] = useState<EngineMode>("local");
-  const [apiProvider, setApiProvider] = useState("google");
-  const [googleApiKey, setGoogleApiKey] = useState("");
-  const [showApiKey, setShowApiKey] = useState(false);
-  const [apiModel, setApiModel] = useState("gemini-2.5-flash");
-  const [apiTestStatus, setApiTestStatus] = useState<string | null>(null);
+  const [trainingBaseSeconds, setTrainingBaseSeconds] = useState(() => projects[0]?.elapsedSeconds ?? 0);
 
   // Training parameters
   const [trainingOpponent, setTrainingOpponent] = useState("baseline");
-  const [trainingAlgorithm, setTrainingAlgorithm] = useState<"qlearning" | "dqn" | "baseline">("qlearning");
-  const [trainingDevice, setTrainingDevice] = useState("auto");
+  const [trainingAlgorithm, setTrainingAlgorithm] = useState<TrainingAlgorithm>("qlearning");
+  const [trainingDevice, setTrainingDevice] = useState<TrainingDevice>("cpu");
+  const [gpuSupported] = useState(() => detectGpuHardware().supported);
+  const [trainingError, setTrainingError] = useState<string | null>(null);
   const [episodesPerBatch, setEpisodesPerBatch] = useState(5000);
   const [learningRate, setLearningRate] = useState(0.1);
   const [discountFactor, setDiscountFactor] = useState(0.95);
@@ -122,7 +136,7 @@ export default function App() {
   const [helpAction, setHelpAction] = useState<Action | null>(null);
 
   // Real Metrics Chart State
-  const [metricHistory, setMetricHistory] = useState<MetricPoint[]>([]);
+  const [metricHistory, setMetricHistory] = useState<MetricPoint[]>(() => projects[0]?.metricHistory ?? []);
   const [chartView, setChartView] = useState<"winrate" | "reward" | "epsilon">("winrate");
 
   // Arena Duel Scoreboard
@@ -139,15 +153,26 @@ export default function App() {
   const hiddenDealer = game.phase === "player";
   const canStart = game.phase === "ready" || game.phase === "over";
 
-  // Persist every project change
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  useEffect(() => { const t = setTimeout(() => saveStoredData(STORAGE_KEYS.blackjackProjects, projects), 500); return () => clearTimeout(t); }, [projects]);
+  // Periodically save all game state and flush the latest snapshot when the page hides.
+  useEffect(() => {
+    const persist = () => saveStoredData(STORAGE_KEYS.blackjackProjects, projectsRef.current);
+    persist();
+    const saveTimer = window.setInterval(persist, 2000);
+    window.addEventListener("pagehide", persist);
+    document.addEventListener("visibilitychange", persist);
+    return () => {
+      window.clearInterval(saveTimer);
+      window.removeEventListener("pagehide", persist);
+      document.removeEventListener("visibilitychange", persist);
+      persist();
+    };
+  }, []);
 
-  // Sync training duration selection
+  // Update the selected project's training duration without changing its method.
   function handleSelectDuration(minutes: number) {
     setTrainMinutes(minutes);
     if (activeTrainingId !== null) {
-      setProjects(prev => prev.map(p => p.id === activeTrainingId ? { ...p, minutes } : p));
+      updateProjects(prev => prev.map(p => p.id === activeTrainingId ? { ...p, minutes } : p));
     }
   }
 
@@ -162,13 +187,22 @@ export default function App() {
   }
 
   function handleSelectProject(id: number | null) {
+    if (trainingRunning) pauseTraining();
     setActiveTrainingId(id);
     if (id !== null) {
-      const p = projects.find(x => x.id === id);
+      const p = projectsRef.current.find(x => x.id === id);
       if (p) {
         setTrainMinutes(p.minutes);
-        setEngineMode(p.engineMode || "local");
+        setTrainingDevice(p.trainingDevice);
+        setTrainingAlgorithm(p.trainingAlgorithm);
+        setTrainingSeconds(p.elapsedSeconds);
+        setTrainingBaseSeconds(p.elapsedSeconds);
+        setMetricHistory(p.metricHistory);
       }
+    } else {
+      setTrainingSeconds(0);
+      setTrainingBaseSeconds(0);
+      setMetricHistory([]);
     }
   }
 
@@ -211,39 +245,63 @@ export default function App() {
 
       // Run real simulation batch on each tick!
       const batchSize = Math.max(50, Math.min(500, Math.round(episodesPerBatch / 20)));
-      const currentQTable = activeProject?.qTable ? { ...activeProject.qTable } : {};
+      const currentQTable: QTable = activeProject?.qTable
+        ? Object.fromEntries(Object.entries(activeProject.qTable).map(([key, values]) => [key, { ...values }]))
+        : {};
+      const previousMetrics = activeProject?.metricHistory ?? metricHistory;
+      const currentEpsilon = previousMetrics.length > 0
+        ? previousMetrics[previousMetrics.length - 1].epsilon
+        : explorationRate;
+      if (activeProject?.trainingDevice === "gpu") {
+        try {
+          if (dispatchGpuBatchEvaluation(batchSize, learningRate) === 0) {
+            throw new Error("GPU acceleration could not initialize a WebGL compute context.");
+          }
+        } catch (error) {
+          console.error("[blackjack-training] GPU batch failed:", error);
+          setTrainingError("เริ่มคำนวณด้วย GPU ไม่สำเร็จ การฝึกหยุดไว้และบันทึกความคืบหน้าแล้ว");
+          setTrainingRunning(false);
+          setTrainingStartedAt(null);
+          setTrainingBaseSeconds(next);
+          updateProjects(old => old.map(p => p.id === activeTrainingId
+            ? { ...p, status: "Ready", elapsedSeconds: next, progress: Math.min(100, next / Math.max(1, limit) * 100) }
+            : p));
+          return;
+        }
+      }
       const { result, updatedEpsilon } = trainBatch(
         currentQTable,
         batchSize,
         learningRate,
         discountFactor,
-        explorationRate,
-        trainingAlgorithm
+        currentEpsilon,
+        activeProject?.trainingAlgorithm ?? "qlearning"
       );
 
       // Save real metrics point
-      setMetricHistory(prev => {
-        const point: MetricPoint = {
-          step: prev.length + 1,
-          timeSeconds: next,
-          totalEpisodes: (prev[prev.length - 1]?.totalEpisodes ?? 0) + batchSize,
-          winRate: Number(result.winRate.toFixed(1)),
-          lossRate: Number(result.lossRate.toFixed(1)),
-          pushRate: Number(result.pushRate.toFixed(1)),
-          avgReward: Number(result.avgReward.toFixed(3)),
-          epsilon: Number(updatedEpsilon.toFixed(3))
-        };
-        return [...prev, point];
-      });
+      const point: MetricPoint = {
+        step: previousMetrics.length + 1,
+        timeSeconds: next,
+        totalEpisodes: (previousMetrics[previousMetrics.length - 1]?.totalEpisodes ?? 0) + batchSize,
+        winRate: Number(result.winRate.toFixed(1)),
+        lossRate: Number(result.lossRate.toFixed(1)),
+        pushRate: Number(result.pushRate.toFixed(1)),
+        avgReward: Number(result.avgReward.toFixed(3)),
+        epsilon: Number(updatedEpsilon.toFixed(3))
+      };
+      const updatedMetrics = [...previousMetrics, point];
+      setMetricHistory(updatedMetrics);
 
       // Update project state with actual played hands and trained Q-Table
-      setProjects(old => old.map(p => {
+      updateProjects(old => old.map(p => {
         if (p.id !== activeTrainingId) return p;
         const newGames = p.games + batchSize;
         return {
           ...p,
           games: newGames,
           qTable: currentQTable,
+          elapsedSeconds: next,
+          metricHistory: updatedMetrics,
           status: next >= limit ? "Complete" : "Training",
           progress: Math.min(100, (next / Math.max(1, limit)) * 100)
         };
@@ -260,7 +318,9 @@ export default function App() {
   }, [
     trainingRunning, activeTrainingId, trainingStartedAt, trainingBaseSeconds,
     totalTrainingSeconds, episodesPerBatch, learningRate, discountFactor,
-    explorationRate, trainingAlgorithm, activeProject?.qTable
+    explorationRate, metricHistory, activeProject?.qTable,
+    activeProject?.trainingDevice, activeProject?.trainingAlgorithm,
+    activeProject?.metricHistory
   ]);
 
   function start() {
@@ -291,6 +351,7 @@ export default function App() {
   }
 
   function createProject() {
+    if (trainingRunning) pauseTraining();
     const id = Math.max(0, ...projects.map(p => p.id)) + 1;
     const newProj: TrainingProject = {
       id,
@@ -300,34 +361,51 @@ export default function App() {
       progress: 0,
       games: 0,
       created: new Date().toLocaleDateString("th-TH"),
-      engineMode
+      trainingDevice,
+      trainingAlgorithm,
+      elapsedSeconds: 0,
+      metricHistory: []
     };
-    setProjects([...projects, newProj]);
+    updateProjects(current => [...current, newProj]);
     setActiveTrainingId(id);
+    setTrainingSeconds(0);
+    setTrainingBaseSeconds(0);
+    setMetricHistory([]);
     setShowNewProject(false);
     setPage("projects");
   }
 
+  function openNewProject() {
+    setProjectName("My Blackjack Agent");
+    setTrainMinutes(1);
+    setTrainingDevice("cpu");
+    setTrainingAlgorithm("qlearning");
+    setShowNewProject(true);
+  }
+
   function beginTraining(project: TrainingProject, resumeAccumulated: boolean = true) {
-    setProjects(old => old.map(p => {
+    const elapsed = resumeAccumulated ? project.elapsedSeconds : 0;
+    const history = resumeAccumulated ? project.metricHistory : [];
+    updateProjects(old => old.map(p => {
       if (p.id !== project.id) return p;
       return {
         ...p,
         minutes: trainMinutes,
         status: "Training",
-        progress: 0,
+        progress: Math.min(100, (elapsed / Math.max(1, trainMinutes * 60)) * 100),
         games: resumeAccumulated ? p.games : 0,
+        elapsedSeconds: elapsed,
+        metricHistory: history,
         qTable: resumeAccumulated ? (p.qTable ? { ...p.qTable } : {}) : {}
       };
     }));
     setActiveTrainingId(project.id);
-    setTrainingSeconds(0);
-    setTrainingBaseSeconds(0);
+    setTrainingSeconds(elapsed);
+    setTrainingBaseSeconds(elapsed);
+    setMetricHistory(history);
+    setTrainingError(null);
     setTrainingStartedAt(Date.now());
     setTrainingRunning(true);
-    if (!resumeAccumulated) {
-      setMetricHistory([]);
-    }
     setPage("training");
   }
 
@@ -336,6 +414,11 @@ export default function App() {
       const elapsed = Math.min(totalTrainingSeconds, trainingBaseSeconds + Math.floor((Date.now() - trainingStartedAt) / 1000));
       setTrainingSeconds(elapsed);
       setTrainingBaseSeconds(elapsed);
+      if (activeTrainingId !== null) {
+        updateProjects(old => old.map(p => p.id === activeTrainingId
+          ? { ...p, status: "Ready", elapsedSeconds: elapsed, progress: Math.min(100, elapsed / Math.max(1, totalTrainingSeconds) * 100) }
+          : p));
+      }
     }
     setTrainingStartedAt(null);
     setTrainingRunning(false);
@@ -353,20 +436,12 @@ export default function App() {
     setTrainingBaseSeconds(0);
     setTrainingStartedAt(null);
     setMetricHistory([]);
+    setTrainingError(null);
     if (activeTrainingId) {
-      setProjects(old => old.map(p => p.id === activeTrainingId ? { ...p, status: "Ready", progress: 0, games: 0 } : p));
+      updateProjects(old => old.map(p => p.id === activeTrainingId
+        ? { ...p, status: "Ready", progress: 0, games: 0, elapsedSeconds: 0, metricHistory: [], qTable: {} }
+        : p));
     }
-  }
-
-  function testApiKey() {
-    if (!googleApiKey.trim()) {
-      setApiTestStatus("กรุณากรอก API Key ก่อนทดสอบ");
-      return;
-    }
-    setApiTestStatus("กำลังตรวจสอบคีย์...");
-    setTimeout(() => {
-      setApiTestStatus(`เชื่อมต่อสำเร็จ: โมเดล ${apiModel} พร้อมใช้งานบน Google AI Studio`);
-    }, 600);
   }
 
   function fmt(seconds: number) {
@@ -646,7 +721,7 @@ export default function App() {
                 <div className="feature-top"><span>02 / TRAIN</span><ArrowRight size={17} /></div>
                 <div className="feature-icon"><BrainCircuit size={23} /></div>
                 <h2>ฝึก AI พร้อมดูกราฟจริง</h2>
-                <p>เลือกเอนจิน Local RL (CPU/GPU) หรือ Cloud AI API พร้อมพล็อตกราฟสด</p>
+                <p>ฝึก Blackjack AI ด้วย CPU หรือ GPU ในเครื่อง พร้อมบันทึกความคืบหน้าและกราฟอัตโนมัติ</p>
                 <div className="feature-link">OPEN TRAINING <ArrowRight size={14} /></div>
               </button>
               <button className="feature-card" onClick={() => setPage("projects")}>
@@ -987,7 +1062,7 @@ export default function App() {
               <div>
                 <p className="eyebrow">02 / TRAINING LAB</p>
                 <h1>Train Your Blackjack Agent</h1>
-                <p className="lede">เลือกระหว่าง Local RL Engine (CPU/GPU ในเครื่อง) หรือ Cloud AI API พร้อมติดตามผลด้วยกราฟจริง</p>
+                <p className="lede">ฝึกด้วย CPU หรือ GPU ในเครื่อง วิธีที่เลือกจะผูกกับโปรเจกต์และเปลี่ยนไม่ได้หลังสร้าง</p>
               </div>
               <div className="training-chip">
                 <span className={trainingRunning ? "pulse-dot" : ""} />
@@ -1009,98 +1084,30 @@ export default function App() {
                   {projects.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
                 </select>
 
-                {/* Unified Engine Selector */}
-                <label className="field-label">เอนจินการประมวลผล (เลือกอย่างใดอย่างหนึ่ง)</label>
-                <div className="engine-mode-tabs">
-                  <button
-                    className={`engine-tab ${engineMode === "local" ? "selected" : ""}`}
-                    onClick={() => {
-                      setEngineMode("local");
-                      if (activeTrainingId) setProjects(old => old.map(p => p.id === activeTrainingId ? { ...p, engineMode: "local" } : p));
-                    }}
-                  >
-                    <Cpu size={14} /> Local RL Engine
-                  </button>
-                  <button
-                    className={`engine-tab ${engineMode === "api" ? "selected" : ""}`}
-                    onClick={() => {
-                      setEngineMode("api");
-                      if (activeTrainingId) setProjects(old => old.map(p => p.id === activeTrainingId ? { ...p, engineMode: "api" } : p));
-                    }}
-                  >
-                    <Cloud size={14} /> Cloud AI API
-                  </button>
+                <label className="field-label">วิธีเทรนที่ผูกกับโปรเจกต์ (เปลี่ยนไม่ได้)</label>
+                <div className="inline-note">
+                  {activeProject?.trainingDevice === "gpu" ? <Gauge size={14} /> : <Cpu size={14} />}
+                  {activeProject?.trainingDevice === "gpu" ? "GPU batch + CPU Q-table updates" : "CPU Q-Learning"}
+                  {activeProject?.trainingDevice === "gpu" ? " · การอัปเดต Q-table ยังคำนวณบน CPU" : ""}
+                  {" · "}
+                  {activeProject?.trainingAlgorithm === "baseline" ? "Baseline" : "Q-Learning"}
                 </div>
 
-                <div style={{ marginTop: 14, display: "flex", gap: 14, flexWrap: "wrap", alignItems: "center" }}>
-                  <div style={{ display: "flex", alignItems: "center", gap: 10, flex: 1, minWidth: 200 }}>
-                    <label style={{ font: "9px var(--mono)", color: "#777", letterSpacing: ".05em" }}>PROVIDER</label>
-                    <select value={apiProvider} onChange={e => setApiProvider(e.target.value)} style={{ flex: 1, padding: "8px 10px", border: "1px solid var(--line)", background: "#fff", font: "inherit" }}>
-                      <option value="google">Google AI Studio</option>
-                      <option value="openai">OpenAI</option>
-                    </select>
-                  </div>
-                  <div style={{ flex: 2, minWidth: 240 }}>
-                    <label style={{ font: "9px var(--mono)", color: "#777", letterSpacing: ".05em", display: "block", marginBottom: 6 }}>API KEY</label>
-                    <div style={{ display: "flex", gap: 6 }}>
-                      <input
-                        type={showApiKey ? "text" : "password"}
-                        value={googleApiKey}
-                        onChange={e => setGoogleApiKey(e.target.value)}
-                        placeholder="• • • • • • • • • •"
-                        style={{ flex: 1, padding: "8px 10px", border: "1px solid var(--line)", background: "#fff", font: "inherit" }}
-                      />
-                      <button className="ghost-button" style={{ whiteSpace: "nowrap" }} onClick={() => setShowApiKey(!showApiKey)}>
-                        {showApiKey ? <EyeOff size={13} /> : <Eye size={13} />}
-                      </button>
-                    </div>
-                  </div>
-                  <button className="primary-action" style={{ flex: "0 0 auto" }} onClick={testApiKey}>
-                    <Gauge size={14} /> ทดสอบ
-                  </button>
+                <label className="field-label">เวลาฝึก (ปรับได้)</label>
+                <div className="duration-options">
+                  {TRAINING_DURATION_OPTIONS.map(minutes => (
+                    <button
+                      key={minutes}
+                      className={trainMinutes === minutes ? "selected" : ""}
+                      onClick={() => handleSelectDuration(minutes)}
+                    >
+                      {minutes < 60 ? `${minutes} น.` : "1 ชม."}
+                    </button>
+                  ))}
                 </div>
-                {apiTestStatus && (
-                  <div className="inline-note" style={{ marginTop: 12 }}>
-                    <BrainCircuit size={14} />
-                    {apiTestStatus}
-                  </div>
-                )}
+                {trainingError && <div className="inline-note" role="alert">{trainingError}</div>}
 
-                <label className="field-label"> MODEL</label>
-                <select value={apiModel} onChange={e => setApiModel(e.target.value)} style={{ width: "100%", padding: "12px", border: "1px solid var(--line)", background: "#fafaf8", color: "#333", font: "inherit" }}>
-                  <option value="gemini-2.5-flash">gemini-2.5-flash (Google AI Studio)</option>
-                  <option value="gemini-2.0-flash">gemini-2.0-flash (Google AI Studio)</option>
-                  <option value="gpt-4o-mini">gpt-4o-mini (OpenAI)</option>
-                  <option value="gpt-4o">gpt-4o (OpenAI)</option>
-                </select>
-
-                {/* Computer / Device Choice */}
-                <label className="field-label">อุปกรณ์ที่ใช้คำนวณ (Local Engine เท่านั้น)</label>
-                <div className="compute-options">
-                  <button className={`${trainingDevice === "auto" ? "selected" : ""}`} onClick={() => setTrainingDevice("auto")}>
-                    <strong>Auto</strong>
-                    <small>เลือก GPU ถ้ามี / มิเช่นนั้นใช้ CPU</small>
-                  </button>
-                  <button className={`${trainingDevice === "gpu" ? "selected" : ""}`} onClick={() => setTrainingDevice("gpu")}>
-                    <strong>GPU</strong>
-                    <small>เร่งความเร็วผ่าน WebGPU/GPGPU</small>
-                  </button>
-                  <button className={`${trainingDevice === "cpu" ? "selected" : ""}`} onClick={() => setTrainingDevice("cpu")}>
-                    <strong>CPU</strong>
-                    <small>ใช้ CPU มาตรฐาน</small>
-                  </button>
-                </div>
-
-                {/* Advanced Settings */}
                 <div className="advanced-settings">
-                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
-                    <span style={{ font: "9px var(--mono)", color: "#777", letterSpacing: ".05em" }}>ALGORITHM</span>
-                    <select value={trainingAlgorithm} onChange={e => setTrainingAlgorithm(e.target.value as any)} style={{ padding: "6px 10px", border: "1px solid var(--line)", background: "#fff", font: "inherit" }}>
-                      <option value="qlearning">Q-Learning (tabular)</option>
-                      <option value="dqn">Deep Q-Network (DQN)</option>
-                      <option value="baseline">Baseline (no training)</option>
-                    </select>
-                  </div>
                   <div className="range-setting">
                     <label><span>LOADED SAMPLES / BATCH</span><strong style={{ fontFamily: "var(--mono)", color: "#222" }}>{episodesPerBatch.toLocaleString()}</strong></label>
                     <input type="range" min={1000} max={20000} step={1000} value={episodesPerBatch} onChange={e => setEpisodesPerBatch(Number(e.target.value))} />
@@ -1123,49 +1130,9 @@ export default function App() {
                   เมื่อเริ่มฝึก ระบบจะจำลองมือ Blackjack ด้วย Q-Learning แบบ Real-time พร้อมอัปเดตกราฟสด
                 </div>
 
-                <button className="outline-full" style={{ marginTop: 18 }} onClick={() => setShowNewProject(true)}>
-                  <Plus size={14} /> โปรเจกต์ใหม่
+                <button className="outline-full full-action project-create-trigger" onClick={openNewProject}>
+                  <Plus size={14} /> สร้างโปรเจกต์ใหม่
                 </button>
-
-                {showNewProject && (
-                  <div className="new-project" style={{ marginTop: 18 }}>
-                    <label className="field-label">ชื่อโปรเจกต์</label>
-                    <input
-                      value={projectName}
-                      onChange={e => setProjectName(e.target.value)}
-                      placeholder="ตัวอย่าง: Agent Project"
-                      style={{ width: "100%", padding: "12px", border: "1px solid var(--line)", background: "#fafaf8", color: "#333", font: "inherit" }}
-                    />
-                    <label className="field-label">ระยะเวลาฝึก (นาที)</label>
-                    <div className="duration-options">
-                      {[1, 5, 10, 15, 30].map(m => (
-                        <button
-                          key={m}
-                          className={trainMinutes === m ? "selected" : ""}
-                          onClick={() => handleSelectDuration(m)}
-                        >
-                          {m} น.
-                          <small>{m * 60} วิ</small>
-                        </button>
-                      ))}
-                      <button
-                        className={trainMinutes === 60 ? "selected" : ""}
-                        onClick={() => handleSelectDuration(60)}
-                      >
-                        60 น.
-                        <small>1 ชม.</small>
-                      </button>
-                    </div>
-
-                    <div style={{ display: "flex", gap: 10, marginTop: 22 }}>
-                      <button className="ghost-button" onClick={() => setShowNewProject(false)}>ยกเลิก</button>
-                      <button className="primary-action" onClick={() => createProject()}>
-                        <Play size={13} /> สร้างโปรเจกต์
-                      </button>
-                    </div>
-                  </div>
-                )}
-
 
               </div>
 
@@ -1181,7 +1148,7 @@ export default function App() {
                     <BrainCircuit size={18} />
                     <div><strong>ยังไม่เลือกโปรเจกต์</strong><small>สร้างโปรเจกต์หรือเลือกจากรายการด้านบนเพื่อเริ่มฝึก</small></div>
                   </div>
-                ) : !projects.find((p: any) => p.id === activeTrainingId) ? (
+                ) : !projects.find(p => p.id === activeTrainingId) ? (
                   <div className="notice">
                     <BrainCircuit size={18} />
                     <div><strong>โปรเจกต์ไม่พบ</strong><small>โปรเจกต์ที่เลือกไม่มีอยู่ในระบบ (อาจถูกลบไปแล้ว)</small></div>
@@ -1198,7 +1165,7 @@ export default function App() {
                       <div><span style={{ font: "8px var(--mono)", color: "#999", letterSpacing: ".05em" }}>GAMES COMPLETED</span><strong>{(activeProject?.games ?? 0).toLocaleString()}</strong></div>
                       <div><span style={{ font: "8px var(--mono)", color: "#999", letterSpacing: ".05em" }}>MODELS</span><strong>1</strong></div>
                     </div>
-                    <button className="primary-action full-action" onClick={() => beginTraining(activeProject!)}>
+                    <button className="primary-action full-action" onClick={() => beginTraining(activeProject!, false)}>
                       <RotateCcw size={14} /> ฝึกซ้ำ
                     </button>
                     <p style={{ font: "9px var(--mono)", color: "#777", marginTop: 14, textAlign: "center" }}>สถานะ: <span style={{ color: "#4d7656" }}>การฝึกเสร็จสิ้น</span> — กดฝึกซ้ำเพื่อเริ่มใหม่</p>
@@ -1225,7 +1192,7 @@ export default function App() {
                       <div><span style={{ font: "8px var(--mono)", color: "#999", letterSpacing: ".05em" }}>PUSH RATE</span><strong>{(latestMetric?.pushRate ?? 0).toFixed(1)}%</strong></div>
                       <div><span style={{ font: "8px var(--mono)", color: "#999", letterSpacing: ".05em" }}>AVG REWARD</span><strong>{(latestMetric?.avgReward ?? 0).toFixed(3)}</strong></div>
                       <div><span style={{ font: "8px var(--mono)", color: "#999", letterSpacing: ".05em" }}>STATE COUNT</span><strong>{(activeProject?.qTable ? Object.keys(activeProject.qTable).length : 0).toLocaleString()}</strong></div>
-                      <div><span style={{ font: "8px var(--mono)", color: "#999", letterSpacing: ".05em" }}>EPISODES</span><strong>{(metricHistory.reduce(((s: any, m: any) => s + m.totalEpisodes), 0)).toLocaleString()}</strong></div>
+                      <div><span style={{ font: "8px var(--mono)", color: "#999", letterSpacing: ".05em" }}>EPISODES</span><strong>{metricHistory.reduce((sum, metric) => sum + metric.totalEpisodes, 0).toLocaleString()}</strong></div>
                     </div>
 
                     <div style={{ marginTop: 20, display: "flex", gap: 12, flexWrap: "wrap" }}>
@@ -1320,55 +1287,12 @@ export default function App() {
               <div>
                 <p className="eyebrow">03 / BLACKJACK PROJECTS</p>
                 <h1>โปรเจกต์ AI ของฉัน</h1>
-                <p className="lede">จัดการโมเดล Q-Learning ที่คุณฝึกฝน ตรวจสอบตารางการตัดสินใจ และส่งไปลงสนามจริง</p>
+                <p className="lede">ข้อมูลโปรเจกต์และผลฝึกถูกจัดเก็บแยกในหมวด Blackjack บนเครื่องโดยอัตโนมัติ</p>
               </div>
-              <button className="primary-action" onClick={() => setShowNewProject(v => !v)}>
-                <Plus size={15} /> {showNewProject ? "ปิดฟอร์ม" : "สร้างโปรเจกต์ AI"}
+              <button className="primary-action" onClick={openNewProject}>
+                <Plus size={15} /> สร้างโปรเจกต์ใหม่
               </button>
             </div>
-
-            {showNewProject && (
-              <div className="panel new-project" style={{ marginBottom: 20 }}>
-                <div className="panel-heading">
-                  <div><span className="eyebrow">NEW MODEL</span><h3>สร้างโปรเจกต์ใหม่</h3></div>
-                  <FolderKanban size={18} />
-                </div>
-                <label className="field-label">ชื่อโมเดล</label>
-                <input
-                  value={projectName}
-                  onChange={e => setProjectName(e.target.value)}
-                  placeholder="ตัวอย่าง: Deep Q-Agent"
-                  style={{ width: "100%", padding: "12px", border: "1px solid var(--line)", background: "#fafaf8", color: "#333", font: "inherit" }}
-                />
-                <label className="field-label">ระยะเวลาฝึก (นาที)</label>
-                <div className="duration-options">
-                  {[1, 5, 10, 15, 30].map(m => (
-                    <button
-                      key={m}
-                      className={trainMinutes === m ? "selected" : ""}
-                      onClick={() => handleSelectDuration(m)}
-                    >
-                      {m} น.
-                      <small>{m * 60} วิ</small>
-                    </button>
-                  ))}
-                  <button
-                    className={trainMinutes === 60 ? "selected" : ""}
-                    onClick={() => handleSelectDuration(60)}
-                  >
-                    60 น.
-                    <small>1 ชม.</small>
-                  </button>
-                </div>
-
-                <div style={{ display: "flex", gap: 10, marginTop: 22 }}>
-                  <button className="ghost-button" onClick={() => setShowNewProject(false)}>ยกเลิก</button>
-                  <button className="primary-action" onClick={() => createProject()}>
-                    <Play size={13} /> สร้างโปรเจกต์
-                  </button>
-                </div>
-              </div>
-            )}
 
             {projects.length === 0 ? (
               <div className="notice">
@@ -1377,10 +1301,10 @@ export default function App() {
               </div>
             ) : (
               <div className="project-list">
-                {projects.map((p: any) => (
-                  <div className="project-card">
+                {projects.map(p => (
+                <div className="project-card" key={p.id}>
                     <div className="project-symbol">
-                      {p.engineMode === "local" ? <Cpu size={22} /> : <Cloud size={22} />}
+                      {p.trainingDevice === "gpu" ? <Gauge size={22} /> : <Cpu size={22} />}
                     </div>
                     <div className="project-main">
                       <div className="project-title">
@@ -1393,7 +1317,9 @@ export default function App() {
                       </div>
                       <div className="project-meta">
                         <span>{p.minutes} นาที</span>
-                        <span>{p.games.toLocaleString()} มือ</span>                          <span>{p.progress.toFixed(0)}%</span>
+                        <span>{p.trainingDevice.toUpperCase()} · {p.trainingAlgorithm.toUpperCase()}</span>
+                        <span>{p.games.toLocaleString()} มือ</span>
+                        <span>{Math.floor(p.elapsedSeconds / 60)}:{String(p.elapsedSeconds % 60).padStart(2, "0")} · {p.progress.toFixed(0)}%</span>
                       </div>
                     </div>
                     <div className="project-actions">
@@ -1485,6 +1411,67 @@ export default function App() {
               </button>
             </div>
           </section>
+        )}
+        {showNewProject && (page === "training" || page === "projects") && (
+          <ProjectCreateModal
+            gameName="Blackjack"
+            onClose={() => setShowNewProject(false)}
+            onCreate={createProject}
+          >
+            <label className="field-label" htmlFor="blackjack-project-name">ชื่อโปรเจกต์</label>
+            <input
+              id="blackjack-project-name"
+              type="text"
+              value={projectName}
+              onChange={event => setProjectName(event.target.value)}
+              placeholder="ตัวอย่าง: Deep Q-Agent"
+              required
+              autoFocus
+            />
+
+            <label className="field-label">ระยะเวลาฝึก (นาที)</label>
+            <div className="duration-options">
+              {TRAINING_DURATION_OPTIONS.map(minutes => (
+                <button
+                  key={minutes}
+                  type="button"
+                  className={trainMinutes === minutes ? "selected" : ""}
+                  onClick={() => setTrainMinutes(minutes)}
+                >
+                  {minutes < 60 ? `${minutes} น.` : "1 ชม."}
+                </button>
+              ))}
+            </div>
+
+            <label className="field-label">อุปกรณ์ฝึก (ล็อกไว้กับโปรเจกต์)</label>
+            <div className="compute-options">
+              <button
+                className={trainingDevice === "cpu" ? "selected" : ""}
+                onClick={() => setTrainingDevice("cpu")}
+                type="button"
+              >
+                <Cpu size={16} /><strong>CPU</strong><small>ฝึก Q-Learning ในเครื่อง</small>
+              </button>
+              <button
+                className={trainingDevice === "gpu" ? "selected" : ""}
+                onClick={() => setTrainingDevice("gpu")}
+                disabled={!gpuSupported}
+                type="button"
+              >
+                <Gauge size={16} /><strong>GPU</strong><small>{gpuSupported ? "เร่งงานแบบ batch ผ่าน WebGL" : "เครื่อง/เบราว์เซอร์นี้ไม่รองรับ WebGL"}</small>
+              </button>
+            </div>
+
+            <label className="field-label" htmlFor="blackjack-project-algorithm">อัลกอริทึมเริ่มต้น (ล็อกไว้กับโปรเจกต์)</label>
+            <select
+              id="blackjack-project-algorithm"
+              value={trainingAlgorithm}
+              onChange={event => setTrainingAlgorithm(event.target.value as TrainingAlgorithm)}
+            >
+              <option value="qlearning">Q-Learning (tabular)</option>
+              <option value="baseline">Baseline (no training)</option>
+            </select>
+          </ProjectCreateModal>
         )}
         </>
         )}

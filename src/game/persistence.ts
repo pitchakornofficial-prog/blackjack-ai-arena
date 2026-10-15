@@ -1,7 +1,8 @@
 /**
  * Persistence helper for saving AI training projects (with trained Q-Tables /
- * Chess model weights) in localStorage so they survive page reloads and
- * dev-server restarts.
+ * Chess model weights) in game-specific localStorage buckets so they survive
+ * page reloads and dev-server restarts. Each game's key is its logical
+ * training-data folder.
  *
  * Data is wrapped in a versioned envelope so future schema migrations can
  * detect and convert (or discard) old payloads safely.
@@ -11,6 +12,7 @@ const ENVELOPE_VERSION = 1;
 const PREFIX = "arena-hub";
 
 export const STORAGE_KEYS = {
+  // Keep each game's training projects in an isolated logical folder.
   blackjackProjects: "projects:blackjack",
   chessProjects: "projects:chess",
   tttProjects: "projects:ttt"

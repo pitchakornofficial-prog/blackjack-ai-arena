@@ -1,6 +1,9 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { trainChessBatch, initialChessProjects } from "../src/game/chessTraining";
 import { DEFAULT_CHESS_WEIGHTS } from "../src/game/chessEngine";
+import * as chessEngine from "../src/game/chessEngine";
+
+afterEach(() => vi.restoreAllMocks());
 
 describe("Chess AI Training System", () => {
   it("initial projects are well configured", () => {
@@ -11,16 +14,32 @@ describe("Chess AI Training System", () => {
 
   it("trainChessBatch updates weights and tracks metrics", () => {
     const startWeights = { ...DEFAULT_CHESS_WEIGHTS };
-    const { result, updatedWeights, updatedEpsilon } = {
-      result: trainChessBatch(startWeights, 100, 0.1, 0.95, 0.2, "selfplay-rl"),
-      updatedWeights: trainChessBatch(startWeights, 100, 0.1, 0.95, 0.2, "selfplay-rl").updatedWeights,
-      updatedEpsilon: trainChessBatch(startWeights, 100, 0.1, 0.95, 0.2, "selfplay-rl").updatedEpsilon
-    };
+    const result = trainChessBatch(startWeights, 2, 0.1, 0.95, 0.2, "selfplay-rl");
 
-    expect(result.batchGames).toBe(100);
+    expect(result.batchGames).toBe(2);
     expect(result.winRate + result.lossRate + result.drawRate).toBeCloseTo(100, 1);
-    expect(updatedWeights.trainedGames).toBe(100);
-    expect(updatedEpsilon).toBeLessThan(0.2);
+    expect(result.updatedWeights.trainedGames).toBe(2);
+    expect(result.updatedEpsilon).toBeLessThan(0.2);
+    expect(Number.isFinite(result.avgReward)).toBe(true);
+    expect(Number.isFinite(result.materialAdv)).toBe(true);
+  });
+
+  it("handles empty batches without changing the trained-game count", () => {
+    const result = trainChessBatch(DEFAULT_CHESS_WEIGHTS, 0, 0.1, 0.95, 0.2, "selfplay-rl");
+
+    expect(result.batchGames).toBe(0);
+    expect(result.updatedWeights.trainedGames).toBe(DEFAULT_CHESS_WEIGHTS.trainedGames);
+    expect(result.winRate + result.lossRate + result.drawRate).toBe(0);
+  });
+
+  it("uses legal board moves to produce chess training games", () => {
+    const legalMoves = vi.spyOn(chessEngine, "getAllLegalMoves");
+
+    const result = trainChessBatch(DEFAULT_CHESS_WEIGHTS, 1, 0.1, 0.95, 0, "selfplay-rl");
+
+    expect(legalMoves).toHaveBeenCalled();
+    expect(result.batchGames).toBe(1);
+    expect(result.winRate + result.lossRate + result.drawRate).toBe(100);
   });
 
   it("initDeepExplore and stepDeepExplore simulate visual self-play and pause/resume", async () => {

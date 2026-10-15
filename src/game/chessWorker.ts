@@ -10,7 +10,10 @@
  *   OUT: { type: "pong" }
  */
 
-import { stepDeepExplore, DeepExploreState } from "./chessTraining";
+import {
+  ChessAlgorithm, ChessBatchResult, DeepExploreState, stepDeepExplore, trainChessBatch
+} from "./chessTraining";
+import { ChessModelWeights } from "./chessEngine";
 
 // Web Worker context
 const ctx: Worker = self as unknown as Worker;
@@ -41,6 +44,27 @@ ctx.onmessage = (event: MessageEvent) => {
       positionsThisBatch
     });
     return;
+  }
+
+  if (msg.type === "train_batch") {
+    const request = msg as {
+      type: "train_batch";
+      weights: ChessModelWeights;
+      batchGames: number;
+      learningRate: number;
+      discountFactor: number;
+      epsilon: number;
+      algorithm: ChessAlgorithm;
+    };
+    const result: ChessBatchResult = trainChessBatch(
+      request.weights,
+      request.batchGames,
+      request.learningRate,
+      request.discountFactor,
+      request.epsilon,
+      request.algorithm
+    );
+    ctx.postMessage({ type: "training_batch_done", result });
   }
 };
 

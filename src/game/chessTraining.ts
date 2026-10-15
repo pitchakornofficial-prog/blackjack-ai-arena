@@ -1,11 +1,10 @@
 import {
-  ChessModelWeights, DEFAULT_CHESS_WEIGHTS, ChessState, newChessGame,
-  getChessAiMove, getLegalMoves, makeMove, boardToFen, isInsufficientMaterial
+  ChessModelWeights, DEFAULT_CHESS_WEIGHTS, ChessState, PieceColor, Square, newChessGame,
+  getAllLegalMoves, getLegalMoves, makeMove, boardToFen, evaluateBoard, isInsufficientMaterial
 } from "./chessEngine";
-import { dispatchGpuBatchEvaluation } from "./gpuAccelerator";
 
 export type ChessAlgorithm = "selfplay-rl" | "td-minimax" | "heuristic-distill";
-export type ChessEngineMode = "local" | "api";
+export type ChessTrainingDevice = "cpu" | "gpu";
 
 export interface ChessTrainingProject {
   id: number;
@@ -15,11 +14,13 @@ export interface ChessTrainingProject {
   progress: number;
   games: number;
   created: string;
-  engineMode: ChessEngineMode;
+  trainingDevice: ChessTrainingDevice;
   algorithm: ChessAlgorithm;
   weights: ChessModelWeights;
   winRate: number;
   depth: number;
+  elapsedSeconds: number;
+  metricHistory: ChessMetricPoint[];
   /**
    * ประเภทโปรเจกต์: "standard" = Batch Self-Play RL (เทรนตามเวลา + กราฟ)
    * "deepexplore" = 10^120 Deep Exploration (สำรวจกระดานจริง แบบ per-project slot)
@@ -60,11 +61,13 @@ export const initialChessProjects: ChessTrainingProject[] = [
     progress: 0,
     games: 0,
     created: "โมเดลมาตรฐานตั้งต้น",
-    engineMode: "local",
+    trainingDevice: "cpu",
     algorithm: "selfplay-rl",
     weights: { ...DEFAULT_CHESS_WEIGHTS },
     winRate: 50.0,
-    depth: 2
+    depth: 2,
+    elapsedSeconds: 0,
+    metricHistory: []
   },
   {
     id: 2,
@@ -74,7 +77,7 @@ export const initialChessProjects: ChessTrainingProject[] = [
     progress: 0,
     games: 0,
     created: "มุ่งเน้นการคุมพื้นที่ด้วยม้า",
-    engineMode: "local",
+    trainingDevice: "cpu",
     algorithm: "td-minimax",
     weights: {
       ...DEFAULT_CHESS_WEIGHTS,
@@ -83,13 +86,15 @@ export const initialChessProjects: ChessTrainingProject[] = [
       depth: 2
     },
     winRate: 52.5,
-    depth: 2
+    depth: 2,
+    elapsedSeconds: 0,
+    metricHistory: []
   }
 ];
 
 /**
- * Runs a simulated batch of self-play reinforcement learning iterations
- * Updates piece evaluation values, positional bonus, and epsilon exploration
+ * Plays complete games using the legal-move engine, then adjusts the model
+ * from the actual game outcomes and material advantage.
  */
 export function trainChessBatch(
   currentWeights: ChessModelWeights,
@@ -104,50 +109,113 @@ export function trainChessBatch(
   let draws = 0;
   let totalReward = 0;
   let totalMatAdv = 0;
+  const gamesPlayed = Math.max(0, Math.floor(batchGames));
 
-  // Run self-play simulation iterations
-  for (let i = 0; i < batchGames; i++) {
-    // Simulated game trajectory influenced by algorithm & exploration
-    const exploreRoll = Math.random();
-    const noise = (Math.random() - 0.48) * 1.5;
-
-    // Center bonus & material advantage effect
-    const quality = (currentWeights.centerBonus / 25) * 0.4 + (currentWeights.pawnAdvanceBonus / 8) * 0.3;
-    const baseWinChance = 0.45 + quality * 0.12 + (exploreRoll < currentEpsilon ? -0.1 : 0.08);
-
-    const outcomeRoll = Math.random();
-    let gameReward = 0;
-    let matAdv = 0;
-
-    if (outcomeRoll < baseWinChance) {
-      wins++;
-      gameReward = 1.0;
-      matAdv = 1.5 + Math.random() * 3.0;
-    } else if (outcomeRoll < baseWinChance + 0.30) {
-      draws++;
-      gameReward = 0.0;
-      matAdv = (Math.random() - 0.5) * 1.0;
-    } else {
-      losses++;
-      gameReward = -1.0;
-      matAdv = -1.5 - Math.random() * 2.5;
+  const chooseMove = (
+    state: ChessState,
+    color: PieceColor,
+    weights: ChessModelWeights,
+    explore: boolean,
+    useMinimax: boolean
+  ): { from: Square; to: Square } | null => {
+    const legalMoves = getAllLegalMoves(state.board, color);
+    if (legalMoves.length === 0) return null;
+    if (explore && Math.random() < currentEpsilon) {
+      return legalMoves[Math.floor(Math.random() * legalMoves.length)];
     }
 
+    let bestScore = color === "b" ? -Infinity : Infinity;
+    let bestMoves: typeof legalMoves = [];
+    for (const move of legalMoves) {
+      const next = makeMove(state, move.from, move.to);
+      let score = next.isCheckmate
+        ? (color === "b" ? 100000 : -100000)
+        : next.isStalemate || isInsufficientMaterial(next.board)
+          ? 0
+          : evaluateBoard(next.board, weights);
+      if (useMinimax && !next.isCheckmate && !next.isStalemate) {
+        const replies = getAllLegalMoves(next.board, next.turn);
+        if (replies.length > 0) {
+          const replyScores = replies.map(reply => {
+            const response = makeMove(next, reply.from, reply.to);
+            return response.isCheckmate
+              ? (color === "b" ? -100000 : 100000)
+              : response.isStalemate || isInsufficientMaterial(response.board)
+                ? 0
+                : evaluateBoard(response.board, weights);
+          });
+          score = color === "b" ? Math.min(...replyScores) : Math.max(...replyScores);
+        }
+      }
+      const isBetter = color === "b" ? score > bestScore : score < bestScore;
+      if (isBetter) {
+        bestScore = score;
+        bestMoves = [move];
+      } else if (score === bestScore) {
+        bestMoves.push(move);
+      }
+    }
+    return bestMoves[Math.floor(Math.random() * bestMoves.length)] ?? legalMoves[0];
+  };
+
+  for (let i = 0; i < gamesPlayed; i++) {
+    const modelColor: PieceColor = i % 2 === 0 ? "b" : "w";
+    const opponentColor: PieceColor = modelColor === "b" ? "w" : "b";
+    const state = newChessGame();
+    let positions = new Set([boardToFen(state.board, state.turn)]);
+    let game = state;
+
+    for (let ply = 0; ply < 160 && !game.isCheckmate && !game.isStalemate; ply++) {
+      const mover = game.turn;
+      const weights = mover === modelColor ? currentWeights : DEFAULT_CHESS_WEIGHTS;
+      const move = chooseMove(game, mover, weights, mover === modelColor, algorithm === "td-minimax");
+      if (!move) break;
+      game = makeMove(game, move.from, move.to);
+
+      const position = boardToFen(game.board, game.turn);
+      if (isInsufficientMaterial(game.board) || positions.has(position)) {
+        break;
+      }
+      positions.add(position);
+    }
+
+    const material = evaluateBoard(game.board, currentWeights);
+    const modelWon = game.isCheckmate && game.turn === opponentColor;
+    const opponentWon = game.isCheckmate && game.turn === modelColor;
+    const gameReward = modelWon ? 1 : opponentWon ? -1 : 0;
+    const matAdv = modelColor === "b" ? material : -material;
+    if (modelWon) wins++;
+    else if (opponentWon) losses++;
+    else draws++;
+
     totalReward += gameReward;
-    totalMatAdv += matAdv;
+    totalMatAdv += matAdv / 100;
   }
 
-  const winRate = (wins / batchGames) * 100;
-  const lossRate = (losses / batchGames) * 100;
-  const drawRate = (draws / batchGames) * 100;
-  const avgReward = totalReward / batchGames;
-  const avgMatAdv = totalMatAdv / batchGames;
+  if (gamesPlayed === 0) {
+    return {
+      batchGames: 0,
+      winRate: 0,
+      lossRate: 0,
+      drawRate: 0,
+      avgReward: 0,
+      materialAdv: 0,
+      updatedWeights: { ...currentWeights, pieceValues: { ...currentWeights.pieceValues } },
+      updatedEpsilon: Math.max(0.01, currentEpsilon * 0.985)
+    };
+  }
+
+  const winRate = (wins / gamesPlayed) * 100;
+  const lossRate = (losses / gamesPlayed) * 100;
+  const drawRate = (draws / gamesPlayed) * 100;
+  const avgReward = totalReward / gamesPlayed;
+  const avgMatAdv = totalMatAdv / gamesPlayed;
 
   // Clone and update weights via gradient / policy adjustment
   const updatedWeights: ChessModelWeights = {
     ...currentWeights,
     pieceValues: { ...currentWeights.pieceValues },
-    trainedGames: currentWeights.trainedGames + batchGames
+    trainedGames: currentWeights.trainedGames + gamesPlayed
   };
 
   // Reinforce positional & tactical values
@@ -172,7 +240,7 @@ export function trainChessBatch(
   const updatedEpsilon = Math.max(0.01, currentEpsilon * 0.985);
 
   return {
-    batchGames,
+    batchGames: gamesPlayed,
     winRate,
     lossRate,
     drawRate,
@@ -260,7 +328,7 @@ export function initDeepExplore(weights?: ChessModelWeights): DeepExploreState {
     positionHistory: { [initFen]: 1 },
     halfmoveClock: 0,
     computeEngine: "headless",
-    hardwareAccelerator: "auto"
+    hardwareAccelerator: "cpu"
   };
 }
 
@@ -528,22 +596,11 @@ export function stepDeepExplore(state: DeepExploreState): DeepExploreState {
 }
 
 /**
- * Headless Execution: Executes N steps in a single synchronous burst (CPU / GPU Turbo)
- * completely bypassing browser rendering / React DOM re-renders until batch completes.
- * When hardwareAccelerator is 'gpu', dispatches shader matrix evaluations directly
- * to the NVIDIA RTX GPU hardware pipelines.
+ * Headless Execution: Executes N steps in a single synchronous burst on the CPU.
+ * GPU shader batches are dispatched by the view alongside worker execution.
  */
 export function stepDeepExploreHeadlessBatch(state: DeepExploreState, batchSteps: number = 250): DeepExploreState {
   let curr = state;
-
-  // If GPU acceleration is enabled, dispatch matrix evaluations directly to the RTX hardware
-  if (state.hardwareAccelerator === "gpu" || state.hardwareAccelerator === "auto") {
-    try {
-      dispatchGpuBatchEvaluation(batchSteps, state.weights.centerBonus);
-    } catch {
-      // Fallback silently if WebGL context isn't available
-    }
-  }
 
   for (let i = 0; i < batchSteps; i++) {
     curr = stepDeepExplore(curr);

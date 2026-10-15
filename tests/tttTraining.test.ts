@@ -68,8 +68,9 @@ describe("trainTTTBatch — real self-play", () => {
 
   it("minimax-teacher: model (O) should rarely beat a perfect teacher", () => {
     const r = trainTTTBatch({}, 100, 0.15, 0.9, 0.3, "minimax-teacher");
-    // ครูแพ้ไม่ได้ → ที่พังของ O ควรต่ำมาก (ไม่เกิน ~10%)
-    expect(r.winRate).toBeLessThan(15);
+    // ครูเล่นสมบูรณ์แบบ จึงไม่มีทางแพ้; ผลเสมอไม่ควรถูกนับเป็นชัยชนะของ O
+    expect(r.winRate).toBe(0);
+    expect(r.lossRate + r.drawRate).toBe(100);
   });
 
 });
