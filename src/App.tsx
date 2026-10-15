@@ -3,7 +3,7 @@ import {
   ArrowLeft, ArrowRight, BrainCircuit, BookOpen, CircleHelp, Clock3, Code2,
   Cpu, FolderKanban, Gauge, House, Info, Play, Plus, RotateCcw, Settings2,
   ShieldCheck, Sparkles, Swords, Trophy, WandSparkles, X, CheckCircle2, Cloud,
-  Layers, Maximize2, Minimize2
+  Eye, EyeOff, Layers, Maximize2, Minimize2, Home
 } from "lucide-react";
 import {
   Action, Card as PlayingCard, GameState, applyAction, applyAiAction,
@@ -12,8 +12,10 @@ import {
 import { QTable, MetricPoint, trainBatch } from "./game/trainer";
 import { getAiDecision } from "./game/aiAgent";
 import ChessView from "./game/ChessView";
+import TTTView from "./game/TTTView";
+import { loadStoredData, saveStoredData, isProjectRecordArray, STORAGE_KEYS } from "./game/persistence";
 
-type ActiveGame = "blackjack" | "chess";
+type ActiveGame = "blackjack" | "chess" | "ttt" | "undecided";
 
 type Page = "home" | "play" | "training" | "projects" | "rules" | "help";
 type Opponent = "baseline" | "thinking" | "project";
@@ -50,6 +52,13 @@ function Card({ card, hidden = false }: { card?: PlayingCard; hidden?: boolean }
   );
 }
 
+// Restore saved projects (with trained Q-Tables) from localStorage; keep the
+// in-memory fallback for fresh browsers so the workspace is never empty.
+const savedBlackjackProjects = loadStoredData<TrainingProject[]>(
+  STORAGE_KEYS.blackjackProjects,
+  isProjectRecordArray
+);
+
 const initialProjects: TrainingProject[] = [
   {
     id: 1,
@@ -64,15 +73,26 @@ const initialProjects: TrainingProject[] = [
 ];
 
 export default function App() {
-  const [activeGame, setActiveGame] = useState<ActiveGame>("blackjack");
+  const [activeGame, setActiveGame] = useState<ActiveGame>("undecided");
+  const [gamePicked, setGamePicked] = useState(false);
+  const showInitialGamePicker = activeGame === "undecided" && !gamePicked;
   const [showGameModal, setShowGameModal] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [page, setPage] = useState<Page>("home");
-  const [game, setGame] = useState<GameState>(() => newGame(Math.random, "play", "duel"));
+  const [game, setGame] = useState<GameState>(newGame(Math.random, "play", "duel"));
   const [bet, setBet] = useState(100);
   const [opponent, setOpponent] = useState<Opponent>("baseline");
   const [showHelp, setShowHelp] = useState(false);
-  const [projects, setProjects] = useState<TrainingProject[]>(initialProjects);
+
+  // Projects restored from localStorage; anything that was mid-training when
+  // the page was closed is reset to "Ready" (progress/games/Q-Table kept).
+  const [projects, setProjects] = useState<TrainingProject[]>(() =>
+    (savedBlackjackProjects ?? initialProjects).map(p => ({
+      ...p,
+      status: p.status === "Training" ? ("Ready" as const) : p.status,
+      qTable: p.qTable && typeof p.qTable === "object" ? p.qTable : undefined
+    }))
+  );
   const [projectName, setProjectName] = useState("My Blackjack Agent");
   const [trainMinutes, setTrainMinutes] = useState(1);
   const [activeTrainingId, setActiveTrainingId] = useState<number | null>(1);
@@ -119,6 +139,10 @@ export default function App() {
   const hiddenDealer = game.phase === "player";
   const canStart = game.phase === "ready" || game.phase === "over";
 
+  // Persist every project change
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => { const t = setTimeout(() => saveStoredData(STORAGE_KEYS.blackjackProjects, projects), 500); return () => clearTimeout(t); }, [projects]);
+
   // Sync training duration selection
   function handleSelectDuration(minutes: number) {
     setTrainMinutes(minutes);
@@ -128,6 +152,15 @@ export default function App() {
   }
 
   // Sync project dropdown
+  function handlePickGame(game: ActiveGame) {
+    setActiveGame(game);
+    setGamePicked(true);
+    setShowGameModal(false);
+    // Start a fresh session in the chosen game
+    setGame(newGame(Math.random, "play", "duel"));
+    setPage("home");
+  }
+
   function handleSelectProject(id: number | null) {
     setActiveTrainingId(id);
     if (id !== null) {
@@ -153,6 +186,7 @@ export default function App() {
   }, [game.phase, game.playMode, game.duelWinner]);
 
   // Alternating turn: When it is AI's turn in Duel mode, AI plays with natural delay
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => {
     if (game.playMode === "duel" && game.phase === "player" && game.currentTurn === "ai") {
       const timer = window.setTimeout(() => {
@@ -165,6 +199,7 @@ export default function App() {
   }, [game.playMode, game.phase, game.currentTurn, game.turnStep, opponent, selectedPlayProject?.qTable]);
 
   // Wall-clock Timer and Real Simulation Loop
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => {
     if (!trainingRunning || !activeTrainingId || trainingStartedAt === null) return;
 
@@ -338,6 +373,10 @@ export default function App() {
     return `${Math.floor(seconds / 60).toString().padStart(2, "0")}:${(seconds % 60).toString().padStart(2, "0")}`;
   }
 
+  function handleShowGameModal() {
+    setShowGameModal(true);
+  }
+
   function toggleFullscreen() {
     if (!document.fullscreenElement) {
       document.documentElement.requestFullscreen().then(() => {
@@ -460,18 +499,15 @@ export default function App() {
   const latestMetric = metricHistory[metricHistory.length - 1];
 
   return (
-    <div className={`app-layout ${isFullscreen ? "fullscreen-mode" : ""}`}>
+    <div className={`app-layout ${isFullscreen ? "fullscreen-mode" : ""}${showInitialGamePicker ? " show-initial-game-picker" : ""}`}>
       <aside className="sidebar">
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "0 4px 22px" }}>
           <button className="brand" style={{ padding: 0 }} onClick={() => setPage("home")}>
-            <span className="brand-icon">{activeGame === "blackjack" ? "♠" : "♞"}</span>
+            <span className="brand-icon">{activeGame === "blackjack" ? "♠" : activeGame === "ttt" ? "⭘" : "♞"}</span>
             <span>
-              {activeGame === "blackjack" ? "BLACKJACK" : "CHESS"}
+              {activeGame === "blackjack" ? "BLACKJACK" : activeGame === "ttt" ? "TIC TAC TOE" : "CHESS"}
               <small>AI ARENA HUB</small>
             </span>
-          </button>
-          <button className="game-switch-btn" title="คลิกเพื่อเลือกเกม" onClick={() => setShowGameModal(true)}>
-            <Layers size={12} /> สลับ
           </button>
         </div>
 
@@ -482,6 +518,16 @@ export default function App() {
             {navItem("play", "เล่นเกม (Arena)", Swords)}
             {navItem("training", "AI Training", BrainCircuit)}
             {navItem("projects", "โปรเจกต์ AI", FolderKanban)}
+            <div className="nav-label nav-label-spaced">LEARN & SUPPORT</div>
+            {navItem("rules", "วิธีเล่นและกติกา", BookOpen)}
+            {navItem("help", "ช่วยเล่น", WandSparkles)}
+          </>
+        ) : activeGame === "ttt" ? (
+          <>
+            {navItem("home", "ภาพรวม", House)}
+            {navItem("play", "โต๊ะดวล O-X", Swords)}
+            {navItem("training", "TTT AI Training", BrainCircuit)}
+            {navItem("projects", "โปรเจกต์ TTT AI", FolderKanban)}
             <div className="nav-label nav-label-spaced">LEARN & SUPPORT</div>
             {navItem("rules", "วิธีเล่นและกติกา", BookOpen)}
             {navItem("help", "ช่วยเล่น", WandSparkles)}
@@ -497,8 +543,8 @@ export default function App() {
           </>
         )}
         <div className="sidebar-bottom">
-          <div className="avatar">{activeGame === "blackjack" ? "BJ" : "CH"}</div>
-          <div><strong>Arena Hub</strong><small>{activeGame === "blackjack" ? "Blackjack Mode" : "Chess Mode"}</small></div>
+          <div className="avatar">{activeGame === "blackjack" ? "BJ" : activeGame === "ttt" ? "TT" : "CH"}</div>
+          <div><strong>Arena Hub</strong><small>{activeGame === "blackjack" ? "Blackjack Mode" : activeGame === "ttt" ? "Tic Tac Toe Mode" : "Chess Mode"}</small></div>
           <span className="online-dot" />
         </div>
       </aside>
@@ -510,28 +556,64 @@ export default function App() {
           </div>
           <div className="topbar-right">
             <button
+              className="game-switch-btn"
+              onClick={handleShowGameModal}
+              title="สลับเกม (Game Hub)"
+            >
+              <Layers size={13} />
+              <span>สลับเกม</span>
+            </button>
+            <button
               className={`fullscreen-btn ${isFullscreen ? "active" : ""}`}
               onClick={toggleFullscreen}
               title={isFullscreen ? "ออกจากโหมดเต็มจอ (ESC)" : "เข้าสู่โหมดเต็มจอ"}
             >
               {isFullscreen ? <Minimize2 size={13} /> : <Maximize2 size={13} />}
-              <span>{isFullscreen ? "ย่อหน้าจอ (ESC)" : "เต็มจอ"}</span>
-            </button>
-            <button className="game-switch-btn" onClick={() => setShowGameModal(true)}>
-              <Layers size={13} /> {activeGame === "blackjack" ? "♠ Blackjack Arena" : "♞ Chess Arena"} <small>(สลับเกม)</small>
+              <span>{isFullscreen ? "ย่อหน้าจอ" : "เต็มจอ"}</span>
             </button>
             <span className="status-dot" /> LOCAL SESSION
-            <button className="top-icon" title="เริ่มเกมใหม่" onClick={() => { if (activeGame === "blackjack") resetGame(); }}>
-              <RotateCcw size={15} />
-            </button>
           </div>
         </header>
 
-        {activeGame === "chess" ? (
+        {/* If no game chosen yet, require selection before entering either mode */}
+        {showInitialGamePicker ? (
+          <div className="game-picker-overlay">
+            <div className="game-picker-card">
+              <div className="modal-title">เลือกเกมที่ต้องการเล่น</div>
+              <p className="modal-lede">เลือกเกมเพื่อเริ่มใช้งาน</p>
+              <div className="game-choice-grid">
+                <button className="game-choice-card dark-card" onClick={() => handlePickGame("blackjack")}>
+                  <div className="game-choice-icon">♠</div>
+                  <strong>Blackjack AI Arena</strong>
+                  <p>สนามไพ่ 21 แต้ม ดวลสลับตากับ AI พร้อมเทรน Q-Learning</p>
+                  <span className="game-choice-tag">ไพ่ · สลับเทิร์น · Q-Learning</span>
+                </button>
+                <button className="game-choice-card" onClick={() => handlePickGame("chess")}>
+                  <div className="game-choice-icon">♞</div>
+                  <strong>Chess AI Arena (หมากรุก)</strong>
+                  <p>กระดานหมากรุกสากล 8x8 ดวลสลับตากับ Minimax Chess AI</p>
+                  <span className="game-choice-tag">หมากรุก · สลับเทิร์น · Minimax</span>
+                </button>
+                <button className="game-choice-card" onClick={() => handlePickGame("ttt")}>
+                  <div className="game-choice-icon">⭘</div>
+                  <strong>Tic Tac Toe AI Arena</strong>
+                  <p>เกม 3 ช่องชนะ ดวลกับ AI ตั้งแต่อ่อนแรงถึง Minimax ที่แพ้ไม่ได้</p>
+                  <span className="game-choice-tag">O/X · สลับเทิร์น · Minimax</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        ) : activeGame === "chess" ? (
           <ChessView
             page={page}
             setPage={setPage}
-            onOpenGameModal={() => setShowGameModal(true)}
+            isFullscreen={isFullscreen}
+            onToggleFullscreen={toggleFullscreen}
+          />
+        ) : activeGame === "ttt" ? (
+          <TTTView
+            page={page}
+            setPage={setPage}
             isFullscreen={isFullscreen}
             onToggleFullscreen={toggleFullscreen}
           />
@@ -600,6 +682,7 @@ export default function App() {
                 <div className="stat-foot"><ShieldCheck size={15} /> เครดิตจำลองเท่านั้น</div>
               </div>
             </div>
+
           </section>
         )}
 
@@ -936,7 +1019,7 @@ export default function App() {
                       if (activeTrainingId) setProjects(old => old.map(p => p.id === activeTrainingId ? { ...p, engineMode: "local" } : p));
                     }}
                   >
-                    <Cpu size={14} /> Local Engine (CPU / GPU)
+                    <Cpu size={14} /> Local RL Engine
                   </button>
                   <button
                     className={`engine-tab ${engineMode === "api" ? "selected" : ""}`}
@@ -945,266 +1028,286 @@ export default function App() {
                       if (activeTrainingId) setProjects(old => old.map(p => p.id === activeTrainingId ? { ...p, engineMode: "api" } : p));
                     }}
                   >
-                    <Cloud size={14} /> Cloud AI API (Gemini)
+                    <Cloud size={14} /> Cloud AI API
                   </button>
                 </div>
 
-                {engineMode === "local" ? (
-                  <>
-                    <label className="field-label">อุปกรณ์ประมวลผลในเครื่อง</label>
-                    <div className="compute-options">
-                      <button className={trainingDevice === "auto" ? "selected" : ""} onClick={() => setTrainingDevice("auto")}>
-                        <Sparkles size={16} /><strong>อัตโนมัติ</strong><small>ตรวจจับฮาร์ดแวร์ที่ดีที่สุด</small>
-                      </button>
-                      <button className={trainingDevice === "cpu" ? "selected" : ""} onClick={() => setTrainingDevice("cpu")}>
-                        <Cpu size={16} /><strong>CPU</strong><small>เหมาะสำหรับ Tabular RL</small>
-                      </button>
-                      <button className={trainingDevice === "gpu" ? "selected" : ""} onClick={() => setTrainingDevice("gpu")}>
-                        <Gauge size={16} /><strong>GPU</strong><small>เร่งคำนวณสำหรับ Neural Net</small>
-                      </button>
-                    </div>
-
-                    <label className="field-label">อัลกอริทึมการเรียนรู้</label>
-                    <select value={trainingAlgorithm} onChange={e => setTrainingAlgorithm(e.target.value as any)}>
-                      <option value="qlearning">Q-Learning (Tabular RL - ปรับค่า Q ในเครื่องจริง)</option>
-                      <option value="dqn">Deep Q-Network (DQN - โครงข่ายประสาทเทียม)</option>
-                      <option value="baseline">Baseline Strategy (ใช้เป็นเกณฑ์มาตรฐานเปรียบเทียบ)</option>
+                <div style={{ marginTop: 14, display: "flex", gap: 14, flexWrap: "wrap", alignItems: "center" }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 10, flex: 1, minWidth: 200 }}>
+                    <label style={{ font: "9px var(--mono)", color: "#777", letterSpacing: ".05em" }}>PROVIDER</label>
+                    <select value={apiProvider} onChange={e => setApiProvider(e.target.value)} style={{ flex: 1, padding: "8px 10px", border: "1px solid var(--line)", background: "#fff", font: "inherit" }}>
+                      <option value="google">Google AI Studio</option>
+                      <option value="openai">OpenAI</option>
                     </select>
-
-                    <div className="advanced-settings">
-                      <span className="eyebrow">HYPERPARAMETERS</span>
-                      <div className="range-setting">
-                        <label>Learning rate (α) <strong>{learningRate.toFixed(2)}</strong></label>
-                        <input type="range" min="0.01" max="0.5" step="0.01" value={learningRate} onChange={e => setLearningRate(Number(e.target.value))} />
-                      </div>
-                      <div className="range-setting">
-                        <label>Discount factor (γ) <strong>{discountFactor.toFixed(2)}</strong></label>
-                        <input type="range" min="0.5" max="0.99" step="0.01" value={discountFactor} onChange={e => setDiscountFactor(Number(e.target.value))} />
-                      </div>
-                      <div className="range-setting">
-                        <label>Exploration rate (ε) <strong>{explorationRate.toFixed(2)}</strong></label>
-                        <input type="range" min="0.01" max="1" step="0.01" value={explorationRate} onChange={e => setExplorationRate(Number(e.target.value))} />
-                      </div>
-                    </div>
-                  </>
-                ) : (
-                  <div style={{ background: "#f8f8f5", padding: 12, border: "1px solid var(--line)", marginBottom: 12 }}>
-                    <p style={{ margin: "0 0 10px", fontSize: 11, color: "#666" }}>
-                      เมื่อเลือก <strong>Cloud AI API</strong> ระบบจะใช้ LLM ในการประเมินกลยุทธ์และการตัดสินใจผ่านคลาวด์ ไม่จำเป็นต้องพึ่งพาชิป GPU ในเครื่อง
-                    </p>
-                    <label className="field-label" style={{ marginTop: 6 }}>ผู้ให้บริการ AI</label>
-                    <select value={apiProvider} onChange={e => setApiProvider(e.target.value)}>
-                      <option value="google">Google Gemini API</option>
-                    </select>
-
-                    <label className="field-label">โมเดล</label>
-                    <select value={apiModel} onChange={e => setApiModel(e.target.value)}>
-                      <option value="gemini-2.5-flash">Gemini 2.5 Flash (ความเร็วสูง เหมาะกับเกม)</option>
-                      <option value="gemini-2.5-pro">Gemini 2.5 Pro (วิเคราะห์เชิงลึก)</option>
-                      <option value="gemini-1.5-flash">Gemini 1.5 Flash (ประหยัดโควตา)</option>
-                    </select>
-
-                    <label className="field-label">API Key</label>
-                    <div className="api-key-row">
+                  </div>
+                  <div style={{ flex: 2, minWidth: 240 }}>
+                    <label style={{ font: "9px var(--mono)", color: "#777", letterSpacing: ".05em", display: "block", marginBottom: 6 }}>API KEY</label>
+                    <div style={{ display: "flex", gap: 6 }}>
                       <input
                         type={showApiKey ? "text" : "password"}
-                        autoComplete="off"
-                        spellCheck={false}
                         value={googleApiKey}
                         onChange={e => setGoogleApiKey(e.target.value)}
-                        placeholder="วาง Google AI Studio API key ที่นี่"
+                        placeholder="• • • • • • • • • •"
+                        style={{ flex: 1, padding: "8px 10px", border: "1px solid var(--line)", background: "#fff", font: "inherit" }}
                       />
-                      <button className="secondary-action" onClick={() => setShowApiKey(v => !v)}>
-                        {showApiKey ? "ซ่อน" : "แสดง"}
-                      </button>
-                      <button className="secondary-action" onClick={testApiKey}>
-                        ทดสอบ
+                      <button className="ghost-button" style={{ whiteSpace: "nowrap" }} onClick={() => setShowApiKey(!showApiKey)}>
+                        {showApiKey ? <EyeOff size={13} /> : <Eye size={13} />}
                       </button>
                     </div>
-                    {apiTestStatus && (
-                      <div style={{ fontSize: 10, color: "#2d663b", marginTop: 7, display: "flex", alignItems: "center", gap: 5 }}>
-                        <CheckCircle2 size={13} /> {apiTestStatus}
-                      </div>
-                    )}
+                  </div>
+                  <button className="primary-action" style={{ flex: "0 0 auto" }} onClick={testApiKey}>
+                    <Gauge size={14} /> ทดสอบ
+                  </button>
+                </div>
+                {apiTestStatus && (
+                  <div className="inline-note" style={{ marginTop: 12 }}>
+                    <BrainCircuit size={14} />
+                    {apiTestStatus}
                   </div>
                 )}
 
-                {/* Duration Options */}
-                <label className="field-label">ระยะเวลาฝึก (ตั้งค่าได้จริง 1-60 นาที)</label>
-                <div className="duration-options">
-                  {[1, 5, 10, 30, 60].map(m => (
-                    <button
-                      key={m}
-                      className={trainMinutes === m ? "selected" : ""}
-                      onClick={() => handleSelectDuration(m)}
-                    >
-                      {m}<small> min</small>
-                    </button>
-                  ))}
-                </div>
-
-                <label className="field-label">Episodes ต่อ Batch</label>
-                <select value={episodesPerBatch} onChange={e => setEpisodesPerBatch(Number(e.target.value))}>
-                  <option value={1000}>1,000 episodes</option>
-                  <option value={5000}>5,000 episodes</option>
-                  <option value={10000}>10,000 episodes</option>
-                  <option value={50000}>50,000 episodes</option>
+                <label className="field-label"> MODEL</label>
+                <select value={apiModel} onChange={e => setApiModel(e.target.value)} style={{ width: "100%", padding: "12px", border: "1px solid var(--line)", background: "#fafaf8", color: "#333", font: "inherit" }}>
+                  <option value="gemini-2.5-flash">gemini-2.5-flash (Google AI Studio)</option>
+                  <option value="gemini-2.0-flash">gemini-2.0-flash (Google AI Studio)</option>
+                  <option value="gpt-4o-mini">gpt-4o-mini (OpenAI)</option>
+                  <option value="gpt-4o">gpt-4o (OpenAI)</option>
                 </select>
 
-                <div className="field-help">
-                  <Clock3 size={14} /> เลือก {trainMinutes} นาที = ฝึก {trainMinutes * 60} วินาทีเป๊ะ (แก้ไขปัญหาระยะเวลาแล้ว)
+                {/* Computer / Device Choice */}
+                <label className="field-label">อุปกรณ์ที่ใช้คำนวณ (Local Engine เท่านั้น)</label>
+                <div className="compute-options">
+                  <button className={`${trainingDevice === "auto" ? "selected" : ""}`} onClick={() => setTrainingDevice("auto")}>
+                    <strong>Auto</strong>
+                    <small>เลือก GPU ถ้ามี / มิเช่นนั้นใช้ CPU</small>
+                  </button>
+                  <button className={`${trainingDevice === "gpu" ? "selected" : ""}`} onClick={() => setTrainingDevice("gpu")}>
+                    <strong>GPU</strong>
+                    <small>เร่งความเร็วผ่าน WebGPU/GPGPU</small>
+                  </button>
+                  <button className={`${trainingDevice === "cpu" ? "selected" : ""}`} onClick={() => setTrainingDevice("cpu")}>
+                    <strong>CPU</strong>
+                    <small>ใช้ CPU มาตรฐาน</small>
+                  </button>
                 </div>
 
-                <button
-                  className="primary-action full-action"
-                  disabled={!activeTrainingId || trainingRunning}
-                  onClick={() => {
-                    const p = projects.find(x => x.id === activeTrainingId);
-                    if (p) beginTraining({ ...p, minutes: trainMinutes }, true);
-                  }}
-                >
-                  <Play size={15} />
-                  {activeProject && activeProject.games > 0
-                    ? `ฝึกสะสมต่ออีก ${trainMinutes} นาที (สะสมต่อจาก ${activeProject.games.toLocaleString()} มือเดิม)`
-                    : `เริ่มฝึกตามเวลาที่กำหนด (${trainMinutes} นาที)`}
+                {/* Advanced Settings */}
+                <div className="advanced-settings">
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+                    <span style={{ font: "9px var(--mono)", color: "#777", letterSpacing: ".05em" }}>ALGORITHM</span>
+                    <select value={trainingAlgorithm} onChange={e => setTrainingAlgorithm(e.target.value as any)} style={{ padding: "6px 10px", border: "1px solid var(--line)", background: "#fff", font: "inherit" }}>
+                      <option value="qlearning">Q-Learning (tabular)</option>
+                      <option value="dqn">Deep Q-Network (DQN)</option>
+                      <option value="baseline">Baseline (no training)</option>
+                    </select>
+                  </div>
+                  <div className="range-setting">
+                    <label><span>LOADED SAMPLES / BATCH</span><strong style={{ fontFamily: "var(--mono)", color: "#222" }}>{episodesPerBatch.toLocaleString()}</strong></label>
+                    <input type="range" min={1000} max={20000} step={1000} value={episodesPerBatch} onChange={e => setEpisodesPerBatch(Number(e.target.value))} />
+                  </div>
+                  <div className="range-setting">
+                    <label><span>LEARNING RATE</span><strong style={{ fontFamily: "var(--mono)", color: "#222" }}>{learningRate.toFixed(2)}</strong></label>
+                    <input type="range" min={0.01} max={1} step={0.01} value={learningRate} onChange={e => setLearningRate(Number(e.target.value))} />
+                  </div>
+                  <div className="range-setting">
+                    <label><span>DISCOUNT FACTOR (γ)</span><strong style={{ fontFamily: "var(--mono)", color: "#222" }}>{discountFactor.toFixed(2)}</strong></label>
+                    <input type="range" min={0.5} max={1} step={0.01} value={discountFactor} onChange={e => setDiscountFactor(Number(e.target.value))} />
+                  </div>
+                  <div className="range-setting">
+                    <label><span>EXPLORATION RATE (ε)</span><strong style={{ fontFamily: "var(--mono)", color: "#222" }}>{explorationRate.toFixed(2)}</strong></label>
+                    <input type="range" min={0} max={1} step={0.01} value={explorationRate} onChange={e => setExplorationRate(Number(e.target.value))} />
+                  </div>
+                </div>
+                <div className="field-help" style={{ marginTop: 14 }}>
+                  <Info size={14} />
+                  เมื่อเริ่มฝึก ระบบจะจำลองมือ Blackjack ด้วย Q-Learning แบบ Real-time พร้อมอัปเดตกราฟสด
+                </div>
+
+                <button className="outline-full" style={{ marginTop: 18 }} onClick={() => setShowNewProject(true)}>
+                  <Plus size={14} /> โปรเจกต์ใหม่
                 </button>
-                {activeProject && activeProject.games > 0 && (
-                  <button
-                    className="outline-full"
-                    style={{ marginTop: 6 }}
-                    disabled={trainingRunning}
-                    onClick={() => {
-                      if (window.confirm(`ต้องการล้างความรู้เดิมของ ${activeProject.name} และเริ่มฝึกใหม่จากศูนย์หรือไม่?`)) {
-                        beginTraining({ ...activeProject, minutes: trainMinutes, games: 0, qTable: {} }, false);
-                      }
-                    }}
-                  >
-                    <RotateCcw size={13} /> รีเซ็ตความรู้เดิม (เริ่มฝึกใหม่จาก 0)
-                  </button>
+
+                {showNewProject && (
+                  <div className="new-project" style={{ marginTop: 18 }}>
+                    <label className="field-label">ชื่อโปรเจกต์</label>
+                    <input
+                      value={projectName}
+                      onChange={e => setProjectName(e.target.value)}
+                      placeholder="ตัวอย่าง: Agent Project"
+                      style={{ width: "100%", padding: "12px", border: "1px solid var(--line)", background: "#fafaf8", color: "#333", font: "inherit" }}
+                    />
+                    <label className="field-label">ระยะเวลาฝึก (นาที)</label>
+                    <div className="duration-options">
+                      {[1, 5, 10, 15, 30].map(m => (
+                        <button
+                          key={m}
+                          className={trainMinutes === m ? "selected" : ""}
+                          onClick={() => handleSelectDuration(m)}
+                        >
+                          {m} น.
+                          <small>{m * 60} วิ</small>
+                        </button>
+                      ))}
+                      <button
+                        className={trainMinutes === 60 ? "selected" : ""}
+                        onClick={() => handleSelectDuration(60)}
+                      >
+                        60 น.
+                        <small>1 ชม.</small>
+                      </button>
+                    </div>
+
+                    <div style={{ display: "flex", gap: 10, marginTop: 22 }}>
+                      <button className="ghost-button" onClick={() => setShowNewProject(false)}>ยกเลิก</button>
+                      <button className="primary-action" onClick={() => createProject()}>
+                        <Play size={13} /> สร้างโปรเจกต์
+                      </button>
+                    </div>
+                  </div>
                 )}
-                <button className="outline-full" style={{ marginTop: 6 }} onClick={() => { setShowNewProject(true); setPage("projects"); }}>
-                  <Plus size={15} /> สร้างโปรเจกต์ใหม่
-                </button>
+
+
               </div>
 
-              {/* Live Session Panel */}
+              {/* Run / Visual Panel */}
               <div className="panel run-panel">
                 <div className="panel-heading">
+                  <div><span className="eyebrow">STATUS</span><h3>สถานะการฝึก</h3></div>
+                  <Gauge size={18} />
+                </div>
+
+                {!activeTrainingId ? (
+                  <div className="notice">
+                    <BrainCircuit size={18} />
+                    <div><strong>ยังไม่เลือกโปรเจกต์</strong><small>สร้างโปรเจกต์หรือเลือกจากรายการด้านบนเพื่อเริ่มฝึก</small></div>
+                  </div>
+                ) : !projects.find((p: any) => p.id === activeTrainingId) ? (
+                  <div className="notice">
+                    <BrainCircuit size={18} />
+                    <div><strong>โปรเจกต์ไม่พบ</strong><small>โปรเจกต์ที่เลือกไม่มีอยู่ในระบบ (อาจถูกลบไปแล้ว)</small></div>
+                  </div>
+                ) : activeProject?.status === "Complete" ? (
                   <div>
-                    <span className="eyebrow">LIVE TRAINING SESSION</span>
-                    <h3>{activeProject?.name ?? "ยังไม่มี Training Session"}</h3>
+                    <div className="timer" style={{ textAlign: "center", margin: "35px 0 18px" }}>
+                      {fmt(trainingSeconds)}
+                      <small>สรุปการฝึกเสร็จสิ้น</small>
+                    </div>
+                    <div className="metric-grid" style={{ marginTop: 10 }}>
+                      <div><span style={{ font: "8px var(--mono)", color: "#999", letterSpacing: ".05em" }}>WIN RATE</span><strong>{(latestMetric?.winRate ?? 50).toFixed(1)}%</strong></div>
+                      <div><span style={{ font: "8px var(--mono)", color: "#999", letterSpacing: ".05em" }}>TOTAL HANDS</span><strong>{(activeProject?.games ?? 0).toLocaleString()}</strong></div>
+                      <div><span style={{ font: "8px var(--mono)", color: "#999", letterSpacing: ".05em" }}>GAMES COMPLETED</span><strong>{(activeProject?.games ?? 0).toLocaleString()}</strong></div>
+                      <div><span style={{ font: "8px var(--mono)", color: "#999", letterSpacing: ".05em" }}>MODELS</span><strong>1</strong></div>
+                    </div>
+                    <button className="primary-action full-action" onClick={() => beginTraining(activeProject!)}>
+                      <RotateCcw size={14} /> ฝึกซ้ำ
+                    </button>
+                    <p style={{ font: "9px var(--mono)", color: "#777", marginTop: 14, textAlign: "center" }}>สถานะ: <span style={{ color: "#4d7656" }}>การฝึกเสร็จสิ้น</span> — กดฝึกซ้ำเพื่อเริ่มใหม่</p>
                   </div>
-                  <div className="run-status">
-                    {trainingRunning ? "SIMULATING REAL HANDS" : activeProject?.status === "Complete" ? "COMPLETE" : "IDLE"}
-                  </div>
-                </div>
-
-                <div className="timer">
-                  {fmt(trainingSeconds)}
-                  <small> / {fmt(totalTrainingSeconds)} (ตั้งไว้ {trainMinutes} นาที)</small>
-                </div>
-
-                <div className="progress-track">
-                  <div className="progress-fill" style={{ width: `${Math.min(100, (trainingSeconds / Math.max(1, totalTrainingSeconds)) * 100)}%` }} />
-                </div>
-                <div className="progress-meta">
-                  <span>TRAINING PROGRESS</span>
-                  <strong>{Math.min(100, Math.round((trainingSeconds / Math.max(1, totalTrainingSeconds)) * 100))}%</strong>
-                </div>
-
-                <div className="metric-grid">
+                ) : trainingRunning ? (
                   <div>
-                    <span>SIMULATED HANDS (เล่นจริง)</span>
-                    <strong>{(activeProject?.games ?? 0).toLocaleString()}</strong>
-                  </div>
-                  <div>
-                    <span>ELAPSED TIME</span>
-                    <strong>{fmt(trainingSeconds)}</strong>
-                  </div>
-                </div>
+                    <div className="timer" style={{ textAlign: "center" }}>
+                      {fmt(trainingSeconds)}
+                      <small>{totalTrainingSeconds}s</small>
+                    </div>
+                    <div className="progress-track">
+                      <div className="progress-fill" style={{ width: `${Math.min(100, (trainingSeconds / totalTrainingSeconds) * 100)}%` }} />
+                    </div>
+                    <div className="progress-meta">
+                      <span>ระยะเวลาฝึก</span>
+                      <span>{trainingSeconds}s / {totalTrainingSeconds}s</span>
+                      <span>ความคืบหน้า</span>
+                      <span>{Math.round((trainingSeconds / totalTrainingSeconds) * 100)}%</span>
+                    </div>
 
-                <div className="run-actions">
-                  <button className="secondary-action" disabled={!trainingRunning} onClick={pauseTraining}>
-                    พักการฝึก
-                  </button>
-                  <button className="primary-action" disabled={!activeTrainingId || trainingRunning || trainingSeconds >= totalTrainingSeconds} onClick={resumeTraining}>
-                    ทำต่อ
-                  </button>
-                  <button className="outline-full" onClick={resetTraining}>
-                    รีเซ็ต
-                  </button>
-                </div>
-                {activeProject && activeProject.games > 0 && (
-                  <button
-                    className="primary-action full-action"
-                    style={{ marginTop: 10 }}
-                    onClick={() => {
-                      setSelectedPlayProjectId(activeProject.id);
-                      setOpponent("project");
-                      setPage("play");
-                    }}
-                  >
-                    <Swords size={15} /> นำโมเดล {activeProject.name} ไปลงแข่งใน Arena ทันที
-                  </button>
+                    <div className="metric-grid" style={{ marginTop: 31 }}>
+                      <div><span style={{ font: "8px var(--mono)", color: "#999", letterSpacing: ".05em" }}>WIN RATE</span><strong>{(latestMetric?.winRate ?? 50).toFixed(1)}%</strong></div>
+                      <div><span style={{ font: "8px var(--mono)", color: "#999", letterSpacing: ".05em" }}>LOSS RATE</span><strong>{(latestMetric?.lossRate ?? 50).toFixed(1)}%</strong></div>
+                      <div><span style={{ font: "8px var(--mono)", color: "#999", letterSpacing: ".05em" }}>PUSH RATE</span><strong>{(latestMetric?.pushRate ?? 0).toFixed(1)}%</strong></div>
+                      <div><span style={{ font: "8px var(--mono)", color: "#999", letterSpacing: ".05em" }}>AVG REWARD</span><strong>{(latestMetric?.avgReward ?? 0).toFixed(3)}</strong></div>
+                      <div><span style={{ font: "8px var(--mono)", color: "#999", letterSpacing: ".05em" }}>STATE COUNT</span><strong>{(activeProject?.qTable ? Object.keys(activeProject.qTable).length : 0).toLocaleString()}</strong></div>
+                      <div><span style={{ font: "8px var(--mono)", color: "#999", letterSpacing: ".05em" }}>EPISODES</span><strong>{(metricHistory.reduce(((s: any, m: any) => s + m.totalEpisodes), 0)).toLocaleString()}</strong></div>
+                    </div>
+
+                    <div style={{ marginTop: 20, display: "flex", gap: 12, flexWrap: "wrap" }}>
+                      <button className="outline-full" style={{ flex: 1, minWidth: 140 }} onClick={pauseTraining}>
+                        <Clock3 size={14} /> หยุดชั่วคราว
+                      </button>
+                      <button className="ghost-button" style={{ flex: 1, minWidth: 140 }} onClick={resetTraining}>
+                        <RotateCcw size={14} /> รีเซ็ต
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <div>
+                    <div style={{ textAlign: "center", padding: "20px 0" }}>
+                      <div className="timer" style={{ margin: "25px 0 15px" }}>
+                        {fmt(trainingSeconds)}
+                        <small>{totalTrainingSeconds}s</small>
+                      </div>
+                      <div className="progress-track">
+                        <div className="progress-fill" style={{ width: `${(trainingSeconds / totalTrainingSeconds) * 100}%` }} />
+                      </div>
+                      <div className="progress-meta">
+                        <span>ระยะเวลาฝึก</span>
+                        <span>{trainingSeconds}s / {totalTrainingSeconds}s</span>
+                        <span>ความคืบหน้า</span>
+                        <span>{Math.round((trainingSeconds / totalTrainingSeconds) * 100)}%</span>
+                      </div>
+
+                      <div className="metric-grid" style={{ marginTop: 31 }}>
+                        <div><span style={{ font: "8px var(--mono)", color: "#999", letterSpacing: ".05em" }}>WIN RATE</span><strong>{(latestMetric?.winRate ?? 50).toFixed(1)}%</strong></div>
+                        <div><span style={{ font: "8px var(--mono)", color: "#999", letterSpacing: ".05em" }}>LOSS RATE</span><strong>{(latestMetric?.lossRate ?? 50).toFixed(1)}%</strong></div>
+                        <div><span style={{ font: "8px var(--mono)", color: "#999", letterSpacing: ".05em" }}>PUSH RATE</span><strong>{(latestMetric?.pushRate ?? 0).toFixed(1)}%</strong></div>
+                        <div><span style={{ font: "8px var(--mono)", color: "#999", letterSpacing: ".05em" }}>AVG REWARD</span><strong>{(latestMetric?.avgReward ?? 0).toFixed(3)}</strong></div>
+                        <div><span style={{ font: "8px var(--mono)", color: "#999", letterSpacing: ".05em" }}>STATE COUNT</span><strong>{(activeProject?.qTable ? Object.keys(activeProject.qTable).length : 0).toLocaleString()}</strong></div>
+                        <div><span style={{ font: "8px var(--mono)", color: "#999", letterSpacing: ".05em" }}>EPISODES</span><strong>{(activeProject?.games ?? 0).toLocaleString()}</strong></div>
+                      </div>
+
+                      <div style={{ marginTop: 24, display: "flex", gap: 10, flexWrap: "wrap" }}>
+                        <button className="primary-action" style={{ flex: 2, minWidth: 160 }} onClick={() => beginTraining(activeProject!)}>
+                          <Play size={14} /> เริ่มฝึก
+                        </button>
+                        <button className="ghost-button" style={{ flex: 1 }} onClick={() => setActiveTrainingId(null)}>
+                          <X size={14} /> ยกเลิก
+                        </button>
+                      </div>
+                    </div>
+                  </div>
                 )}
 
-                <div className="notice">
-                  <Info size={15} />
-                  <span>
-                    เมื่อกดเริ่มฝึก ระบบจะคำนวณและจำลองมือ Blackjack จริงในเบราว์เซอร์ พร้อมอัปเดต Q-Values และพล็อตกราฟด้านล่างทันที
-                  </span>
-                </div>
-              </div>
-            </div>
+                {/* Real-time chart area */}
+                {metricHistory.length > 0 && (
+                  <div style={{ marginTop: 28 }}>
+                    <div className="chart-header-row">
+                      <span style={{ font: "9px var(--mono)", color: "#888", letterSpacing: ".1em" }}>LOOKBACK CHART</span>
+                      <div className="chart-type-buttons">
+                        <button className={`chart-type-btn ${chartView === "winrate" ? "active" : ""}`} onClick={() => setChartView("winrate")}>Win Rate</button>
+                        <button className={`chart-type-btn ${chartView === "reward" ? "active" : ""}`} onClick={() => setChartView("reward")}>Reward</button>
+                        <button className={`chart-type-btn ${chartView === "epsilon" ? "active" : ""}`} onClick={() => setChartView("epsilon")}>ε-Greedy</button>
+                      </div>
+                    </div>
+                    {renderRealChart()}
 
-            {/* REAL GRAPH METRICS PANEL */}
-            <div className="panel chart-panel" style={{ marginTop: 16 }}>
-              <div className="chart-header-row">
-                <div>
-                  <span className="eyebrow">REAL SIMULATION METRICS</span>
-                  <h3 style={{ margin: "4px 0 0" }}>กราฟผลการฝึกจริง (Real-Time Metrics)</h3>
-                </div>
-                <div className="chart-type-buttons">
-                  <button
-                    className={`chart-type-btn ${chartView === "winrate" ? "active" : ""}`}
-                    onClick={() => setChartView("winrate")}
-                  >
-                    อัตราชนะ (Win Rate %)
-                  </button>
-                  <button
-                    className={`chart-type-btn ${chartView === "reward" ? "active" : ""}`}
-                    onClick={() => setChartView("reward")}
-                  >
-                    รางวัลเฉลี่ย (Avg Reward)
-                  </button>
-                  <button
-                    className={`chart-type-btn ${chartView === "epsilon" ? "active" : ""}`}
-                    onClick={() => setChartView("epsilon")}
-                  >
-                    Exploration (ε)
-                  </button>
-                </div>
-              </div>
-
-              {renderRealChart()}
-
-              <div className="chart-live-stats">
-                <div className="stat-box">
-                  <span>WIN RATE (ปัจจุบัน)</span>
-                  <strong>{latestMetric ? `${latestMetric.winRate}%` : "—"}</strong>
-                </div>
-                <div className="stat-box">
-                  <span>AVG REWARD / HAND</span>
-                  <strong>{latestMetric ? latestMetric.avgReward : "—"}</strong>
-                </div>
-                <div className="stat-box">
-                  <span>LOSS / PUSH RATE</span>
-                  <strong>{latestMetric ? `${latestMetric.lossRate}% / ${latestMetric.pushRate}%` : "—"}</strong>
-                </div>
-                <div className="stat-box">
-                  <span>CURRENT EPSILON (ε)</span>
-                  <strong>{latestMetric ? latestMetric.epsilon : explorationRate.toFixed(2)}</strong>
-                </div>
+                    <div className="chart-live-stats" style={{ marginTop: 16 }}>
+                      <div className="stat-box">
+                        <span>WIN RATE LAST</span>
+                        <strong>{(latestMetric?.winRate ?? 0).toFixed(1)}%</strong>
+                      </div>
+                      <div className="stat-box">
+                        <span>LOSS RATE LAST</span>
+                        <strong>{(latestMetric?.lossRate ?? 0).toFixed(1)}%</strong>
+                      </div>
+                      <div className="stat-box">
+                        <span>PUSH RATE LAST</span>
+                        <strong>{(latestMetric?.pushRate ?? 0).toFixed(1)}%</strong>
+                      </div>
+                      <div className="stat-box">
+                        <span>AVG REWARD LAST</span>
+                        <strong>{(latestMetric?.avgReward ?? 0).toFixed(3)}</strong>
+                      </div>
+                    </div>
+                  </div>
+                )}
               </div>
             </div>
           </section>
@@ -1215,252 +1318,223 @@ export default function App() {
           <section className="page">
             <div className="page-heading">
               <div>
-                <p className="eyebrow">03 / AGENT WORKSPACE</p>
-                <h1>Your AI Projects</h1>
-                <p className="lede">โปรเจกต์จะเก็บตารางการเรียนรู้ Q-Table และพารามิเตอร์การฝึกที่นำไปใช้แข่งขันใน Arena ได้</p>
+                <p className="eyebrow">03 / BLACKJACK PROJECTS</p>
+                <h1>โปรเจกต์ AI ของฉัน</h1>
+                <p className="lede">จัดการโมเดล Q-Learning ที่คุณฝึกฝน ตรวจสอบตารางการตัดสินใจ และส่งไปลงสนามจริง</p>
               </div>
-              <button className="primary-action" onClick={() => setShowNewProject(true)}>
-                <Plus size={15} /> สร้างโปรเจกต์
+              <button className="primary-action" onClick={() => setShowNewProject(v => !v)}>
+                <Plus size={15} /> {showNewProject ? "ปิดฟอร์ม" : "สร้างโปรเจกต์ AI"}
               </button>
             </div>
 
             {showNewProject && (
-              <div className="panel new-project">
+              <div className="panel new-project" style={{ marginBottom: 20 }}>
                 <div className="panel-heading">
-                  <div><span className="eyebrow">NEW AGENT</span><h3>สร้างโปรเจกต์ AI ใหม่</h3></div>
-                  <button className="top-icon" onClick={() => setShowNewProject(false)}><X size={15} /></button>
+                  <div><span className="eyebrow">NEW MODEL</span><h3>สร้างโปรเจกต์ใหม่</h3></div>
+                  <FolderKanban size={18} />
                 </div>
-                <label className="field-label">ชื่อโปรเจกต์</label>
-                <input value={projectName} onChange={e => setProjectName(e.target.value)} placeholder="เช่น Deep Blackjack Pro" />
-
-                <label className="field-label">เอนจินการฝึก</label>
-                <div className="engine-mode-tabs" style={{ margin: "8px 0 14px" }}>
-                  <button className={`engine-tab ${engineMode === "local" ? "selected" : ""}`} onClick={() => setEngineMode("local")}>
-                    <Cpu size={14} /> Local Engine (CPU/GPU)
-                  </button>
-                  <button className={`engine-tab ${engineMode === "api" ? "selected" : ""}`} onClick={() => setEngineMode("api")}>
-                    <Cloud size={14} /> Cloud AI API
-                  </button>
-                </div>
-
-                <label className="field-label">ระยะเวลาฝึกเริ่มต้น</label>
+                <label className="field-label">ชื่อโมเดล</label>
+                <input
+                  value={projectName}
+                  onChange={e => setProjectName(e.target.value)}
+                  placeholder="ตัวอย่าง: Deep Q-Agent"
+                  style={{ width: "100%", padding: "12px", border: "1px solid var(--line)", background: "#fafaf8", color: "#333", font: "inherit" }}
+                />
+                <label className="field-label">ระยะเวลาฝึก (นาที)</label>
                 <div className="duration-options">
-                  {[1, 5, 10, 30, 60].map(m => (
-                    <button key={m} className={trainMinutes === m ? "selected" : ""} onClick={() => handleSelectDuration(m)}>
-                      {m}<small> min</small>
+                  {[1, 5, 10, 15, 30].map(m => (
+                    <button
+                      key={m}
+                      className={trainMinutes === m ? "selected" : ""}
+                      onClick={() => handleSelectDuration(m)}
+                    >
+                      {m} น.
+                      <small>{m * 60} วิ</small>
                     </button>
                   ))}
+                  <button
+                    className={trainMinutes === 60 ? "selected" : ""}
+                    onClick={() => handleSelectDuration(60)}
+                  >
+                    60 น.
+                    <small>1 ชม.</small>
+                  </button>
                 </div>
-                <button className="primary-action" style={{ marginTop: 16 }} onClick={createProject}>
-                  สร้างโปรเจกต์ <ArrowRight size={15} />
-                </button>
+
+                <div style={{ display: "flex", gap: 10, marginTop: 22 }}>
+                  <button className="ghost-button" onClick={() => setShowNewProject(false)}>ยกเลิก</button>
+                  <button className="primary-action" onClick={() => createProject()}>
+                    <Play size={13} /> สร้างโปรเจกต์
+                  </button>
+                </div>
               </div>
             )}
 
-            <div className="project-list">
-              {projects.map(p => (
-                <div className="project-card" key={p.id}>
-                  <div className="project-symbol"><BrainCircuit size={21} /></div>
-                  <div className="project-main">
-                    <div className="project-title">
-                      <h3>{p.name}</h3>
-                      <span className={`project-status ${p.status.toLowerCase()}`}>
-                        {p.status === "Ready" ? "พร้อมฝึก" : p.status === "Training" ? "กำลังฝึก" : "ฝึกเสร็จแล้ว"}
-                      </span>
-                      <span className="project-status" style={{ background: "#f0f0eb" }}>
-                        {p.engineMode === "api" ? "Cloud AI API" : "Local RL Engine"}
-                      </span>
+            {projects.length === 0 ? (
+              <div className="notice">
+                <FolderKanban size={18} />
+                <div><strong>ยังไม่มีโปรเจกต์</strong><small>สร้างโปรเจกต์ใหม่เพื่อเริ่มเทรน Agent</small></div>
+              </div>
+            ) : (
+              <div className="project-list">
+                {projects.map((p: any) => (
+                  <div className="project-card">
+                    <div className="project-symbol">
+                      {p.engineMode === "local" ? <Cpu size={22} /> : <Cloud size={22} />}
                     </div>
-                    <p>สร้างเมื่อ {p.created} · ระยะเวลาฝึก {p.minutes} นาที · สถานะโมเดล: {p.qTable ? `มีข้อมูล ${Object.keys(p.qTable).length} states` : "ยังไม่มีข้อมูล"}</p>
-                    <div className="mini-progress"><div style={{ width: `${p.progress}%` }} /></div>
-                    <div className="project-meta">
-                      <span>{p.progress.toFixed(0)}% complete</span>
-                      <span>{p.games.toLocaleString()} simulated hands</span>
+                    <div className="project-main">
+                      <div className="project-title">
+                        <h3>{p.name}</h3>
+                        <span className={`project-status ${p.status.toLowerCase()}`}>{p.status}</span>
+                      </div>
+                      <p>{p.created}</p>
+                      <div className="mini-progress">
+                        <div style={{ width: `${p.progress}%` }} />
+                      </div>
+                      <div className="project-meta">
+                        <span>{p.minutes} นาที</span>
+                        <span>{p.games.toLocaleString()} มือ</span>                          <span>{p.progress.toFixed(0)}%</span>
+                      </div>
+                    </div>
+                    <div className="project-actions">
+                      <button
+                        className="outline-full"
+                        onClick={() => {
+                          handleSelectProject(p.id);
+                          setPage("training");
+                        }}
+                      >
+                        <Play size={13} /> ฝึก
+                      </button>
                     </div>
                   </div>
-                  <div className="project-actions">
-                    <button
-                      className="outline-action"
-                      title="เลือกโมเดลนี้และไปลงแข่งใน Arena ทันที"
-                      onClick={() => {
-                        setSelectedPlayProjectId(p.id);
-                        setOpponent("project");
-                        setPage("play");
-                      }}
-                    >
-                      <Swords size={13} /> แข่งใน Arena
-                    </button>
-                    <button
-                      className="secondary-action"
-                      onClick={() => {
-                        handleSelectProject(p.id);
-                        setPage("training");
-                      }}
-                    >
-                      รายละเอียด
-                    </button>
-                    <button
-                      className="primary-action"
-                      onClick={() => {
-                        handleSelectDuration(p.minutes);
-                        beginTraining(p);
-                      }}
-                    >
-                      ฝึก AI <Play size={13} />
-                    </button>
-                  </div>
-                </div>
-              ))}
-            </div>
+                ))}
+              </div>
+            )}
           </section>
         )}
 
-        {/* ================= PAGE: RULES ================= */}
         {page === "rules" && (
           <section className="page">
             <div className="page-heading">
               <div>
-                <p className="eyebrow">LEARN / RULEBOOK</p>
-                <h1>Blackjack & Arena Rules</h1>
-                <p className="lede">เป้าหมายคือทำคะแนนให้ใกล้ 21 มากที่สุด โดยไม่เกิน 21 และเอาชนะเจ้ามือ</p>
-              </div>
-              <div className="rule-stamp">21<small>BLACKJACK</small></div>
-            </div>
-            <div className="rules-grid">
-              <div className="panel">
-                <div className="panel-heading"><h3>ค่าของไพ่</h3><BookOpen size={17} /></div>
-                <div className="rule-line"><span>A (Ace)</span><strong>1 หรือ 11</strong></div>
-                <div className="rule-line"><span>2–9</span><strong>ตามหน้าไพ่</strong></div>
-                <div className="rule-line"><span>10, J, Q, K</span><strong>10 คะแนน</strong></div>
-                <div className="rule-line"><span>Natural Blackjack</span><strong>A + ไพ่ 10 แต้ม (จ่าย 3:2)</strong></div>
-              </div>
-              <div className="panel">
-                <div className="panel-heading"><h3>คำสั่งในเกม</h3><Swords size={17} /></div>
-                <div className="rule-line"><span><b>Hit (จั่ว)</b><small>จั่วไพ่เพิ่ม 1 ใบ</small></span><strong>+</strong></div>
-                <div className="rule-line"><span><b>Stand (หยุด)</b><small>หยุดจั่วและจบเทิร์น</small></span><strong>Ⅱ</strong></div>
-                <div className="rule-line"><span><b>Double</b><small>เพิ่มเดิมพัน รับไพ่หนึ่งใบแล้วจบ</small></span><strong>×2</strong></div>
-                <div className="rule-line"><span><b>Split</b><small>แยกไพ่คู่เป็นสองมือ</small></span><strong>⑂</strong></div>
+                <p className="eyebrow">RULES & GUIDE</p>
+                <h1>วิธีเล่นและกติกา</h1>
+                <p className="lede">กฎพื้นฐานของ Blackjack สำหรับโหมด Arena Duel</p>
               </div>
             </div>
-            <div className="panel rules-detail" style={{ marginTop: 14 }}>
+            <div className="panel" style={{ marginBottom: 18 }}>
               <div className="panel-heading">
-                <div><span className="eyebrow">ARENA DUEL MECHANICS</span><h3>กติกาการสลับเทิร์นใน Arena</h3></div>
-                <ShieldCheck size={18} />
+                <div><span className="eyebrow">BASICS</span><h3>กติกาพื้นฐาน</h3></div>
+                <BookOpen size={18} />
               </div>
               <div className="rules-bullets">
-                <p><span>01</span> ในโหมด Arena Duel ผู้เล่นและ AI คู่แข่งจะสลับกันเล่นคนละตา (Alternating Turns)</p>
-                <p><span>02</span> เมื่อคุณกด Hit คุณจะได้รับไพ่ และตาเดินจะสลับไปยัง AI ทันที เพื่อให้ AI เลือกว่าจะ Hit หรือ Stand</p>
-                <p><span>03</span> เมื่อทั้งสองฝ่าย Stand หรือ Bust เจ้ามือจะทำการเปิดไพ่และจั่วให้ถึง 17 แต้มตามกติกาคาสิโนสากล</p>
-                <p><span>04</span> สกอร์บอร์ดจะเปรียบเทียบผลระหว่างคุณและ AI ว่าใครทำผลงานได้ดีกว่าในรอบนั้น</p>
+                <p><span>1.</span> เป้าหมายคือให้ผลรวมไพ่เข้าใกล้ 21 มากที่สุด โดยไม่เกิน 21 (Bust)</p>
+                <p><span>2.</span> รับไพ่ 2 ใบแรก ทั้งหงาย (เจ้ามือมีหนึ่งใบคว่ำ)</p>
+                <p><span>3.</span> ผู้เล่นเลือก Hit (จั่ว), Stand (หยุด), Double (เพิ่มเดิมพัน 2 เท่า + จั่ว 1 ใบ), Split (แยกไพ่เมื่อไพ่ 2 ใบเท่ากัน)</p>
+                <p><span>4.</span> เจ้ามือจะจั่วจนถึง 17 ขึ้นไป (S17)</p>
               </div>
             </div>
-            <button className="primary-action" style={{ marginTop: 14 }} onClick={() => setPage("play")}>
-              เข้าเล่นเกมทันที <ArrowRight size={15} />
-            </button>
+            <div className="panel">
+              <div className="panel-heading">
+                <div><span className="eyebrow">PAYOUTS</span><h3>อัตราจ่าย</h3></div>
+                <Trophy size={18} />
+              </div>
+              <div className="setting-row"><span>Blackjack (A + 10)</span><strong>3:2</strong></div>
+              <div className="setting-row"><span>ชนะปกติ</span><strong>1:1</strong></div>
+              <div className="setting-row"><span>เจ้ามือ Bust</span><strong>1:1</strong></div>
+              <div className="setting-row"><span>เสมอ (Push)</span><strong>คืนเดิมพัน</strong></div>
+            </div>
           </section>
         )}
 
-        {/* ================= PAGE: HELP ================= */}
         {page === "help" && (
           <section className="page">
             <div className="page-heading">
               <div>
-                <p className="eyebrow">LEARN / STRATEGY GUIDE</p>
-                <h1>Basic Strategy Reference</h1>
-                <p className="lede">คำแนะนำทางสถิติเพื่อลด House Edge ของคาสิโนให้เหลือน้อยที่สุด</p>
+                <p className="eyebrow">HELP & STRATEGY</p>
+                <h1>ตัวช่วยตัดสินใจ</h1>
+                <p className="lede">คำแนะนำจาก Basic Strategy เพื่อใช้เป็นแนวทางในการเล่น Blackjack</p>
               </div>
-              <div className="help-symbol"><WandSparkles size={27} /></div>
             </div>
-            <div className="help-grid">
-              <div className="panel">
-                <div className="panel-heading">
-                  <div><span className="eyebrow">QUICK TIPS</span><h3>หลักการสำคัญ</h3></div>
-                  <CircleHelp size={18} />
-                </div>
-                <div className="help-tip">
-                  <span>01</span>
-                  <div><strong>Hard 17 ขึ้นไป</strong><p>หยุดจั่ว (Stand) เสมอ เพราะโอกาส Bust สูงกว่า 69%</p></div>
-                </div>
-                <div className="help-tip">
-                  <span>02</span>
-                  <div><strong>แต้ม 10 หรือ 11</strong><p>พิจารณา Double เมื่อเจ้ามือเปิดไพ่ 2–9 เพื่อเพิ่มผลกำไรสูงสุด</p></div>
-                </div>
-                <div className="help-tip">
-                  <span>03</span>
-                  <div><strong>ไพ่คู่ A–A หรือ 8–8</strong><p>แยก (Split) เสมอ เพื่อเปลี่ยนสถานะเสี่ยงเป็นมือที่มีโอกาสชนะสูง</p></div>
-                </div>
-                <div className="help-tip">
-                  <span>04</span>
-                  <div><strong>เจ้ามือเปิด 4, 5, 6 (ไพ่อ่อน)</strong><p>หยุดจั่วตั้งแต่แต้ม 12 ขึ้นไป ปล่อยให้เจ้ามือมีความเสี่ยง Bust เอง</p></div>
-                </div>
+            <div className="panel" style={{ marginBottom: 14 }}>
+              <div className="panel-heading">
+                <div><span className="eyebrow">BASIC STRATEGY</span><h3>ตารางพื้นฐาน</h3></div>
+                <Sparkles size={18} />
               </div>
-              <div className="panel">
-                <div className="panel-heading">
-                  <div><span className="eyebrow">ASSIST MODE</span><h3>ใช้ตัวช่วยในเกม</h3></div>
-                  <Sparkles size={18} />
-                </div>
-                <p className="panel-copy">
-                  ระหว่างเล่นในหน้า Play Arena เมื่อถึงตาของคุณ คุณสามารถคลิกปุ่ม <strong>"ช่วยเล่น"</strong> ใต้ปุ่มควบคุม เพื่อดูคำแนะนำจากสถิติที่เหมาะสมที่สุดกับแต้มในมือ
-                </p>
-                <button className="primary-action full-action" onClick={() => setPage("play")}>
-                  ไปที่หน้าเล่นเกม <ArrowRight size={15} />
-                </button>
+              <p className="panel-copy">ช่วยแนะนำการเล่นตามความน่าจะเป็น (Basic Strategy) ซึ่งสามารถลดโอกาสเสียเปรียบให้เจ้ามือได้ ใช้เป็นแนวทางในการตัดสินใจทุกตาเดิน</p>
+              <div className="setting-row"><span>ไพ่ผู้เล่น Hard 12–16 vs เจ้ามือ 2–6</span><strong>Stand (หยุด)</strong></div>
+              <div className="setting-row"><span>ไพ่ผู้เล่น Hard 12–16 vs เจ้ามือ 7–A</span><strong>Hit (จั่ว)</strong></div>
+              <div className="setting-row"><span>ไพ่ผู้เล่น 11</span><strong>Double (เดิมพันเพิ่ม)</strong></div>
+              <div className="setting-row"><span>ไพ่ผู้เล่น A-A หรือ 8-8</span><strong>Split (แยก)</strong></div>
+            </div>
+            <div className="panel">
+              <div className="panel-heading">
+                <div><span className="eyebrow">QUICK START</span><h3>เริ่มต้นใช้งาน</h3></div>
+                <BookOpen size={18} />
               </div>
+              <button className="guide-row" onClick={() => setPage("play")}>
+                <span className="guide-icon"><Swords size={17} /></span>
+                <span><strong>ลงโต๊ะดวล AI</strong><small>ไปหน้าเล่นเกม Arena Duel</small></span>
+                <ArrowRight size={16} />
+              </button>
+              <button className="guide-row" onClick={() => setPage("rules")}>
+                <span className="guide-icon"><BookOpen size={17} /></span>
+                <span><strong>กติกาพื้นฐาน</strong><small>ดูกฎกติกา Blackjack ทั้งหมด</small></span>
+                <ArrowRight size={16} />
+              </button>
             </div>
           </section>
         )}
         </>
         )}
+          {showGameModal && (
+            <div className="game-modal-overlay" onClick={() => setShowGameModal(false)}>
+              <section
+                className="game-modal"
+                role="dialog"
+                aria-modal="true"
+                aria-labelledby="game-modal-title"
+                onClick={event => event.stopPropagation()}
+              >
+                <div className="game-modal-header">
+                  <div>
+                    <span className="eyebrow">ARENA GAME HUB</span>
+                    <h2 id="game-modal-title" className="game-modal-title">เลือกเกมที่ต้องการเล่น</h2>
+                  </div>
+                  <button
+                    className="top-icon"
+                    onClick={() => setShowGameModal(false)}
+                    aria-label="ปิดหน้าต่างเลือกเกม"
+                  >
+                    <X size={15} />
+                  </button>
+                </div>
+                <p className="modal-lede">เลือกเกมเพื่อสลับไปยังสนามที่ต้องการ</p>
+                <div className="game-modal-body game-choice-grid">
+                  <button className={`game-choice-card ${activeGame === "blackjack" ? "dark-card" : ""}`} onClick={() => handlePickGame("blackjack")}>
+                    <div className="game-choice-icon">♠</div>
+                    <strong>Blackjack AI Arena</strong>
+                    <p>สนามไพ่ 21 แต้ม ดวลสลับตากับ AI พร้อมเทรน Q-Learning</p>
+                    <span className="game-choice-tag">ไพ่ · สลับเทิร์น · Q-Learning</span>
+                  </button>
+                  <button className={`game-choice-card ${activeGame === "chess" ? "dark-card" : ""}`} onClick={() => handlePickGame("chess")}>
+                    <div className="game-choice-icon">♞</div>
+                    <strong>Chess AI Arena (หมากรุก)</strong>
+                    <p>กระดานหมากรุกสากล 8x8 ดวลสลับตากับ Minimax Chess AI</p>
+                    <span className="game-choice-tag">หมากรุก · สลับเทิร์น · Minimax</span>
+                  </button>
+                  <button className={`game-choice-card ${activeGame === "ttt" ? "dark-card" : ""}`} onClick={() => handlePickGame("ttt")}>
+                    <div className="game-choice-icon">⭘</div>
+                    <strong>Tic Tac Toe AI Arena</strong>
+                    <p>เกม 3 ช่องชนะ ดวลกับ AI ตั้งแต่อ่อนแรงถึง Minimax ที่แพ้ไม่ได้</p>
+                    <span className="game-choice-tag">O/X · สลับเทิร์น · Minimax</span>
+                  </button>
+                </div>
+              </section>
+            </div>
+          )}
       </main>
-
-      {/* Game Selector Modal */}
-      {showGameModal && (
-        <div className="game-modal-overlay" onClick={() => setShowGameModal(false)}>
-          <div className="game-modal" onClick={e => e.stopPropagation()}>
-            <div className="game-modal-header">
-              <div>
-                <span className="eyebrow">ARENA GAME SELECTOR</span>
-                <h3 style={{ margin: "4px 0 0", fontSize: 16 }}>เลือกเกมที่ต้องการเล่น</h3>
-              </div>
-              <button className="top-icon" onClick={() => setShowGameModal(false)}>✕</button>
-            </div>
-            <div className="game-modal-body">
-              <div
-                className={`game-card-pick ${activeGame === "blackjack" ? "active" : ""}`}
-                onClick={() => {
-                  setActiveGame("blackjack");
-                  setShowGameModal(false);
-                }}
-              >
-                <span className="pick-badge">{activeGame === "blackjack" ? "กำลังเล่นอยู่" : "พร้อมใช้งาน"}</span>
-                <div className="game-icon">♠</div>
-                <h3>Blackjack AI Arena</h3>
-                <p>เกมไพ่ 21 แต้มคาสิโนสากล ดวลสลับตากับ AI พร้อมระบบเทรน Q-Learning และกราฟผลลัพธ์แบบเรียลไทม์</p>
-                <button className="select-btn">
-                  {activeGame === "blackjack" ? "เล่นเกมนี้อยู่ (คลิกเพื่อปิด)" : "เลือกเล่น Blackjack"} <ArrowRight size={13} />
-                </button>
-              </div>
-
-              <div
-                className={`game-card-pick ${activeGame === "chess" ? "active" : ""}`}
-                onClick={() => {
-                  setActiveGame("chess");
-                  setShowGameModal(false);
-                }}
-              >
-                <span className="pick-badge">{activeGame === "chess" ? "กำลังเล่นอยู่" : "พร้อมใช้งาน"}</span>
-                <div className="game-icon">♞</div>
-                <h3>Chess AI Arena (หมากรุก)</h3>
-                <p>กระดานหมากรุกสากล 8x8 สลับตาเดินกับ Minimax Chess AI พร้อมระบบ Thought Reasoning และบันทึกประวัติการเดิน</p>
-                <button className="select-btn">
-                  {activeGame === "chess" ? "เล่นเกมนี้อยู่ (คลิกเพื่อปิด)" : "เลือกเล่น Chess"} <ArrowRight size={13} />
-                </button>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 }
-

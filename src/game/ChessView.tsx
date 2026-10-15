@@ -2,7 +2,7 @@ import { useEffect, useState, useMemo, useRef, useCallback } from "react";
 import {
   ArrowRight, BookOpen, BrainCircuit, CheckCircle2,
   Cpu, RotateCcw, ShieldCheck, Sparkles, Swords, Trophy,
-  Layers, Gauge, Cloud, FolderKanban, Play, Pause, Plus,
+  Gauge, Cloud, FolderKanban, Play, Pause, Plus,
   Clock3, Info, Trash2, Maximize2, Minimize2, Undo2
 } from "lucide-react";
 import {
@@ -14,9 +14,11 @@ import {
 import {
   ChessTrainingProject, ChessMetricPoint, initialChessProjects,
   trainChessBatch, ChessAlgorithm, ChessEngineMode,
-  DeepExploreState, initDeepExplore, stepDeepExplore, stepDeepExploreHeadlessBatch
+  DeepExploreState, initDeepExplore, stepDeepExplore, stepDeepExploreHeadlessBatch,
+  isDeepExploreSnapshot, reviveDeepExplore
 } from "./chessTraining";
 import { detectGpuHardware, GpuDeviceInfo, dispatchGpuBatchEvaluation } from "./gpuAccelerator";
+import { loadStoredData, saveStoredData, clearStoredData, isProjectRecordArray, deepExploreKey, STORAGE_KEYS } from "./persistence";
 
 const PIECE_SYMBOLS: Record<PieceColor, Record<PieceType, string>> = {
   w: { k: "♔", q: "♕", r: "♖", b: "♗", n: "♘", p: "♙" },
@@ -32,12 +34,32 @@ const PIECE_NAMES: Record<PieceType, string> = {
   p: "Pawn (เบี้ย)"
 };
 
-type ChessOpponent = "baseline" | "thinking" | "master" | "project";
+/**
+ * Restores chess projects from localStorage. Weights are merged over
+ * DEFAULT_CHESS_WEIGHTS so a partially-saved payload can never produce an
+ * incomplete weight object inside the training loop. Projects that were
+ * mid-training when the page was closed are reset to "Ready" (progress and
+ * accumulated games are kept) so no stale "Training" state lingers.
+ */
+function restoreChessProjects(): ChessTrainingProject[] {
+  const saved = loadStoredData<ChessTrainingProject[]>(
+    STORAGE_KEYS.chessProjects,
+    isProjectRecordArray
+  );
+  if (!saved) {
+    return initialChessProjects;
+  }
+  return saved.map(p => ({
+    ...p,
+    status: p.status === "Training" ? ("Ready" as const) : p.status,
+    weights: { ...DEFAULT_CHESS_WEIGHTS, ...(p.weights ?? {}) }
+  }));
+}
 
+type ChessOpponent = "baseline" | "thinking" | "master" | "project";
 type ChessViewProps = {
   page: string;
   setPage: (p: any) => void;
-  onOpenGameModal: () => void;
   isFullscreen?: boolean;
   onToggleFullscreen?: () => void;
 };
@@ -45,7 +67,6 @@ type ChessViewProps = {
 export default function ChessView({
   page,
   setPage,
-  onOpenGameModal,
   isFullscreen = false,
   onToggleFullscreen
 }: ChessViewProps) {
@@ -55,13 +76,15 @@ export default function ChessView({
   const [chessOpponent, setChessOpponent] = useState<ChessOpponent>("thinking");
   const [chessStats, setChessStats] = useState({ playerWins: 0, aiWins: 0, draws: 0 });
 
-  // Chess Projects State
-  const [chessProjects, setChessProjects] = useState<ChessTrainingProject[]>(initialChessProjects);
+  // Chess Projects State — restored from localStorage across reloads
+  const [chessProjects, setChessProjects] = useState<ChessTrainingProject[]>(restoreChessProjects);
   const [activeTrainingId, setActiveTrainingId] = useState<number>(1);
   const [selectedPlayProjectId, setSelectedPlayProjectId] = useState<number>(1);
   const [showNewProject, setShowNewProject] = useState(false);
   const [newProjectName, setNewProjectName] = useState("AlphaPawn Chess");
   const [newProjectAlgo, setNewProjectAlgo] = useState<ChessAlgorithm>("selfplay-rl");
+  // ประเภทโปรเจกต์ที่เลือกตอนสร้าง: แยกโหมดฝึกของแต่ละโปรเจกต์ออกจากกัน
+  const [newProjectMode, setNewProjectMode] = useState<"standard" | "deepexplore">("standard");
 
   // Training Execution State
   const [trainMinutes, setTrainMinutes] = useState(1);
@@ -90,9 +113,25 @@ export default function ChessView({
   const [metricHistory, setMetricHistory] = useState<ChessMetricPoint[]>([]);
   const [chartView, setChartView] = useState<"winrate" | "reward" | "epsilon">("winrate");
 
-  // Training Sub-modes: Standard Self-Play vs 10^120 Deep Exploration
-  const [trainingSubMode, setTrainingSubMode] = useState<"standard" | "deepexplore">("deepexplore");
-  const [deepExplore, setDeepExplore] = useState<DeepExploreState>(() => initDeepExplore());
+  // Training Sub-modes: โหมดการฝึกยึดตาม "ประเภทโปรเจกต์" ที่เลือก (แยกกันแน่นอน)
+  // standard = Batch Self-Play RL, deepexplore = 10^120 Deep Exploration
+  // ซึ่งมีสถานะบันทึกของตัวเองแยกแยะรายโปรเจกต์ (slot ไม่ปนกันระหว่างโปรเจกต์)
+  const [trainingSubMode, setTrainingSubMode] = useState<"standard" | "deepexplore">(() =>
+    chessProjects.find(p => p.id === activeTrainingId)?.trainMode === "deepexplore" ? "deepexplore" : "standard"
+  );
+  // ป้ายว่า state deepExplore ที่กำลังแสดงอยู่นี้ "เป็นกองของโปรเจกต์ไหน"
+  const [deepExploreProjectId, setDeepExploreProjectId] = useState<number | null>(() => {
+    const p = chessProjects.find(x => x.id === activeTrainingId);
+    return p?.trainMode === "deepexplore" ? p.id : null;
+  });
+  const [deepExplore, setDeepExplore] = useState<DeepExploreState>(() => {
+    const p = chessProjects.find(x => x.id === activeTrainingId);
+    if (p?.trainMode === "deepexplore") {
+      const saved = loadStoredData<DeepExploreState>(deepExploreKey(p.id), isDeepExploreSnapshot);
+      if (saved) return reviveDeepExplore(saved);
+    }
+    return initDeepExplore();
+  });
   const [deepExploreSpeedMs, setDeepExploreSpeedMs] = useState<number>(450); // visual move interval ms
   const [gpuInfo, setGpuInfo] = useState<GpuDeviceInfo>(() => detectGpuHardware());
 
@@ -103,6 +142,27 @@ export default function ChessView({
   const totalTrainingSeconds = trainMinutes * 60;
   const activeProject = useMemo(() => chessProjects.find(p => p.id === activeTrainingId) ?? chessProjects[0], [chessProjects, activeTrainingId]);
   const selectedPlayProject = useMemo(() => chessProjects.find(p => p.id === selectedPlayProjectId) ?? chessProjects[0], [chessProjects, selectedPlayProjectId]);
+
+  // Persist every project change (trained weights included) to localStorage
+  // with a trailing debounce so frequent training updates don't rewrite
+  // storage on every tick — the final state is always saved.
+  useEffect(() => {
+    const saveTimer = window.setTimeout(() => {
+      saveStoredData(STORAGE_KEYS.chessProjects, chessProjects);
+    }, 500);
+    return () => window.clearTimeout(saveTimer);
+  }, [chessProjects]);
+
+  // บันทึกสถานะ Deep Exploration แบบ "เฉพาะโปรเจกต์ตัวเอง" ลง slot ของมัน
+  // (ไม่ปนกับข้อมูลเทรนมาตรฐานหรือโปรเจกต์อื่น) — บังคับ paused=true ตอนเซฟ
+  // เพื่อให้เซสชันที่กู้คืนไม่สั่งรันเองโดยที่ผู้ใช้ไม่ได้กด
+  useEffect(() => {
+    if (deepExploreProjectId === null) return;
+    const saveTimer = window.setTimeout(() => {
+      saveStoredData(deepExploreKey(deepExploreProjectId), { ...deepExplore, paused: true });
+    }, 600);
+    return () => window.clearTimeout(saveTimer);
+  }, [deepExplore, deepExploreProjectId]);
 
   // ─── Helper: dispatch GPU work from main thread while worker computes board ───
   const fireGpuDispatch = useCallback((state: DeepExploreState, batchSize: number) => {
@@ -263,6 +323,9 @@ export default function ChessView({
   // Wall-Clock Timer and Real Self-Play Training Simulation Loop
   useEffect(() => {
     if (!trainingRunning || !activeTrainingId || trainingStartedAt === null) return;
+    // โปรเจกต์ Deep Exploration ห้ามโดน batch เทรนมาตรฐานปั๊มข้อมูล
+    // (การันตีว่าแต่ละประเภทโปรเจกต์บันทึกแค่ตัวเลขของตัวเอง)
+    if (activeProject?.trainMode === "deepexplore") return;
 
     const timer = window.setInterval(() => {
       const elapsed = trainingBaseSeconds + Math.floor((Date.now() - trainingStartedAt) / 1000);
@@ -324,7 +387,7 @@ export default function ChessView({
   }, [
     trainingRunning, activeTrainingId, trainingStartedAt, trainingBaseSeconds,
     totalTrainingSeconds, batchSize, learningRate, discountFactor,
-    explorationRate, trainingAlgorithm, activeProject?.weights, metricHistory
+    explorationRate, trainingAlgorithm, activeProject?.weights, metricHistory, activeProject?.trainMode
   ]);
 
   // Legal destinations for selected square
@@ -394,10 +457,68 @@ export default function ChessView({
       setTrainMinutes(p.minutes);
       setEngineMode(p.engineMode || "local");
       setTrainingAlgorithm(p.algorithm || "selfplay-rl");
+      // หน้า Training ยึดโหมดตามประเภทของโปรเจกต์ที่ถูกเลือก
+      const mode = p.trainMode === "deepexplore" ? "deepexplore" : "standard";
+      setTrainingSubMode(mode);
+      if (mode === "deepexplore") ensureDeepExploreSlot(p.id);
     }
   }
 
+  /**
+   * สลับไปยกเครื่องนาโลคเรชนที่จับหมากในโปรเจกต์: เซฟ slot เก่าก่อนแบบ instant,
+   * หยุด worker เก่าให้ข้อความที่ยังวิ่งอยู่ไม่หล่นทับ slot ใหม่, แล้วโหลด
+   * เฉพาะสถานะ Deep Exploration ของโปรเจกต์นี้ (หรือสร้างใหม่ถ้าไม่เคยเซฟ)
+   */
+  function ensureDeepExploreSlot(projectId: number) {
+    if (deepExploreProjectId === projectId) return;
+    if (deepExploreProjectId !== null) {
+      saveStoredData(deepExploreKey(deepExploreProjectId), { ...deepExplore, paused: true });
+    }
+    if (workerRef.current) {
+      workerRef.current.terminate();
+      workerRef.current = null;
+      workerBusyRef.current = false;
+    }
+    const saved = loadStoredData<DeepExploreState>(deepExploreKey(projectId), isDeepExploreSnapshot);
+    setDeepExplore(saved ? reviveDeepExplore(saved) : initDeepExplore());
+    setDeepExploreProjectId(projectId);
+  }
+
+  /**
+   * สลับโหมดการฝึกของโปรเจกต์: บันทึกประเภทลงโปรเจกต์ปัจจุบันด้วย
+   * เพื่อให้การแยกประเภทตามโปรเจกต์เป็นข้อมูลกลางที่ถูก persist
+   */
+  function switchTrainingMode(mode: "standard" | "deepexplore") {
+    setTrainingSubMode(mode);
+    if (activeProject) {
+      const id = activeProject.id;
+      setChessProjects(prev => prev.map(p => p.id === id ? { ...p, trainMode: mode } : p));
+      if (mode === "deepexplore") {
+        pauseTraining(); // หยุดตัวจับเวลาโหมดมาตรฐานก่อนเสือมี loop วิ่งสอง
+        ensureDeepExploreSlot(id);
+      }
+    }
+  }
+
+  /** ใช้จากการ์ดโปรเจกต์/ลิงก์: เปิดหน้า Training ตามประเภทของโปรเจกต์นั้น */
+  function openTrainingFor(project: ChessTrainingProject) {
+    setActiveTrainingId(project.id);
+    setTrainMinutes(project.minutes);
+    setTrainingSubMode(project.trainMode === "deepexplore" ? "deepexplore" : "standard");
+    if (project.trainMode === "deepexplore") ensureDeepExploreSlot(project.id);
+    setPage("training");
+  }
+
   function beginTraining(project: ChessTrainingProject, resumeAccumulated: boolean = true) {
+    // โปรเจกต์ประเภท Deep Exploration ไม่ใช้ตัวจับเวลาเทรนมาตรฐานเลย
+    // สร้าง/กลับมาทำต่อจาก session สำรวจของมันเองแทน
+    if (project.trainMode === "deepexplore") {
+      setActiveTrainingId(project.id);
+      setTrainingSubMode("deepexplore");
+      ensureDeepExploreSlot(project.id);
+      setPage("training");
+      return;
+    }
     setChessProjects(old => old.map(p => {
       if (p.id !== project.id) return p;
       return {
@@ -462,8 +583,13 @@ export default function ChessView({
       algorithm: newProjectAlgo,
       weights: { ...DEFAULT_CHESS_WEIGHTS },
       winRate: 50.0,
-      depth: 2
+      depth: 2,
+      trainMode: newProjectMode
     };
+    if (newProjectMode === "deepexplore") {
+      // โปรเจกต์ Deep Exploration ใหม่ได้ slot ของตัวเอง (ไม่รับข้อมูลเก่า)
+      saveStoredData(deepExploreKey(newId), initDeepExplore());
+    }
     setChessProjects(prev => [created, ...prev]);
     setActiveTrainingId(newId);
     setSelectedPlayProjectId(newId);
@@ -728,14 +854,13 @@ export default function ChessView({
           <div className="bottom-grid">
             <div className="panel">
               <div className="panel-heading">
-                <div><span className="eyebrow">SWITCH GAME</span><h3>เลือกเกมอื่นใน Arena</h3></div>
-                <Layers size={18} />
+                <div><span className="eyebrow">GET STARTED</span><h3>เริ่มต้นใช้งาน</h3></div>
+                <Sparkles size={18} />
               </div>
-              <p className="panel-copy">
-                คุณสามารถสลับระหว่าง <strong>Blackjack AI Arena</strong> (เกมไพ่ & Q-Learning) และ <strong>Chess AI Arena</strong> (หมากรุก & Self-Play RL) ได้ตลอดเวลา
-              </p>
-              <button className="primary-action" onClick={onOpenGameModal}>
-                <Layers size={14} /> เปิดหน้าต่างเลือกเกม (Game Hub)
+              <button className="guide-row" onClick={() => setPage("rules")}>
+                <span className="guide-icon"><BookOpen size={17} /></span>
+                <span><strong>วิธีเล่นและกติกาหมากรุก</strong><small>ทำความเข้าใจการเดินหมากและกติกา FIDE</small></span>
+                <ArrowRight size={16} />
               </button>
             </div>
 
@@ -750,7 +875,6 @@ export default function ChessView({
         </section>
       )}
 
-      {/* ================= CHESS: PLAY ARENA ================= */}
       {/* ================= CHESS: PLAY ARENA ================= */}
       {page === "play" && isFullscreen && (
         <div className="chess-fullscreen-theater">
@@ -891,16 +1015,11 @@ export default function ChessView({
               >
                 <Undo2 size={13} /> ย้อนกลับตาเดิน (Ctrl+Z)
               </button>
-              <div style={{ display: "flex", gap: 6 }}>
-                <button className="secondary-action" style={{ flex: 1 }} onClick={onOpenGameModal}>
-                  <Layers size={13} /> สลับเกม
+              {onToggleFullscreen && (
+                <button className="outline-full" style={{ width: "100%", marginTop: 0 }} onClick={onToggleFullscreen}>
+                  <Minimize2 size={13} /> ออกจากเต็มจอ
                 </button>
-                {onToggleFullscreen && (
-                  <button className="outline-full" style={{ flex: 1, marginTop: 0 }} onClick={onToggleFullscreen}>
-                    <Minimize2 size={13} /> ออกจากเต็มจอ
-                  </button>
-                )}
-              </div>
+              )}
             </div>
           </div>
         </div>
@@ -922,22 +1041,22 @@ export default function ChessView({
               </div>
               {onToggleFullscreen && (
                 <button
-                  className="fullscreen-btn"
+                  className={`fullscreen-btn ${isFullscreen ? "active" : ""}`}
                   onClick={onToggleFullscreen}
-                  title="เปิดโหมดเต็มจอ"
+                  title="เปิด/ปิดโหมดเต็มจอ"
                 >
-                  <Maximize2 size={13} />
-                  <span>เต็มจอ</span>
+                  {isFullscreen ? <Minimize2 size={13} /> : <Maximize2 size={13} />}
+                  <span>{isFullscreen ? "ออกจากเต็มจอ" : "เต็มจอ"}</span>
                 </button>
               )}
               <button className="ghost-button" onClick={() => setPage("rules")}>
-                <BookOpen size={15} /> กติกาหมากรุก
+                <BookOpen size={15} /> กติกา
               </button>
             </div>
           </div>
 
           {/* Opponent Selection Grid */}
-          <div className="opponent-grid" style={{ gridTemplateColumns: "repeat(4, minmax(0, 1fr))" }}>
+          <div className="opponent-grid four-cols">
             <button className={`opponent-card ${chessOpponent === "baseline" ? "chosen" : ""}`} onClick={() => setChessOpponent("baseline")}>
               <span className="opponent-icon"><ShieldCheck /></span>
               <span className="opponent-tag">DEFAULT</span>
@@ -1003,8 +1122,7 @@ export default function ChessView({
                       className="link-button"
                       onClick={() => {
                         if (selectedPlayProject) {
-                          setActiveTrainingId(selectedPlayProject.id);
-                          setPage("training");
+                          openTrainingFor(selectedPlayProject);
                         }
                       }}
                     >
@@ -1016,32 +1134,49 @@ export default function ChessView({
             </div>
           )}
 
-          {/* Turn Banner */}
-          <div className={`turn-banner ${chess.turn === "w" ? "player-turn" : "ai-turn"}`}>
-            <div>
-              {chess.isCheckmate ? (
-                <strong>เกมสิ้นสุด: รุกฆาต (CHECKMATE)! {chess.turn === "b" ? "คุณชนะ!" : "AI ชนะ!"}</strong>
-              ) : chess.isStalemate ? (
-                <strong>เกมสิ้นสุด: อับจน (STALEMATE) · เสมอกัน!</strong>
-              ) : chess.isCheck ? (
-                <strong style={{ color: "#c92a2a" }}>เตือน: มีการรุก (CHECK)! ฝ่าย {chess.turn === "w" ? "ขาว (คุณ)" : "ดำ (AI)"} ต้องป้องกัน King</strong>
-              ) : chess.turn === "w" ? (
-                <span>ตาของคุณ (White): คลิกตัวหมากสีขาวเพื่อดูตำแหน่งที่เดินได้</span>
-              ) : (
-                <span>ตาของ {chessOpponent === "project" ? selectedPlayProject?.name : "AI"} (Black): AI กำลังคำนวณและเลือกตาเดิน...</span>
-              )}
-            </div>
-            <strong>{chess.turn === "w" ? "YOUR TURN (WHITE)" : "AI TURN (BLACK)"}</strong>
-          </div>
+          {/* Main Chess Arena Layout (Standardized with Blackjack & TTT) */}
+          <div className="game-layout">
+            <div className="game-board">
+              {/* Turn Banner */}
+              <div className={`turn-banner ${chess.turn === "w" ? "player-turn" : "ai-turn"}`}>
+                <div>
+                  {chess.isCheckmate ? (
+                    <strong>🏁 เกมสิ้นสุด: รุกฆาต (CHECKMATE)! {chess.turn === "b" ? "คุณชนะ!" : "AI ชนะ!"}</strong>
+                  ) : chess.isStalemate ? (
+                    <strong>🤝 เกมสิ้นสุด: อับจน (STALEMATE) · เสมอกัน!</strong>
+                  ) : chess.isCheck ? (
+                    <strong style={{ color: "#c92a2a" }}>⚠️ เตือน: มีการรุก (CHECK)! ฝ่าย {chess.turn === "w" ? "ขาว (คุณ)" : "ดำ (AI)"} ต้องป้องกัน King</strong>
+                  ) : chess.turn === "w" ? (
+                    <span>🟢 <strong>ตาของคุณ (White):</strong> คลิกตัวหมากสีขาวเพื่อดูตำแหน่งที่เดินได้</span>
+                  ) : (
+                    <span>🟡 <strong>ตาของ {chessOpponent === "project" ? selectedPlayProject?.name : "AI"} (Black):</strong> กำลังคิดวิเคราะห์...</span>
+                  )}
+                </div>
+                <strong>{chess.turn === "w" ? "YOUR TURN (WHITE)" : "AI TURN (BLACK)"}</strong>
+              </div>
 
-          {/* Main Chess Arena Layout */}
-          <div className="chess-layout">
-            {renderChessboard()}
+              {/* Stage Board */}
+              <div className="board-stage">
+                {renderChessboard()}
+              </div>
 
-            {/* Chess Info & Sidebar */}
-            <div className="chess-info-panel">
+              {/* In-Game Action Controls (Matching Blackjack & TTT controls bar) */}
+              <div className="controls">
+                <button
+                  className="primary-action action-button"
+                  disabled={chess.moveHistory.length === 0 || chess.turn !== "w"}
+                  onClick={handleUndoMove}
+                  title="ย้อนกลับการเดินหมากตาที่แล้ว (Undo)"
+                >
+                  <Undo2 size={14} /> ย้อนกลับตาเดิน (UNDO)
+                </button>
+                <button className="secondary-action action-button" onClick={handleReset}>
+                  <RotateCcw size={14} /> เริ่มรอบใหม่
+                </button>
+              </div>
+
               {chess.aiThought && (
-                <div className="ai-thought-box">
+                <div className="ai-thought-box" style={{ margin: "14px 20px" }}>
                   <BrainCircuit size={16} />
                   <div>
                     <strong>AI Thought Process:</strong>
@@ -1049,44 +1184,61 @@ export default function ChessView({
                   </div>
                 </div>
               )}
+            </div>
 
-              {/* Material & Advantage Box */}
-              <div className="captured-box">
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
-                  <strong>หมากที่ถูกกิน (Captured Pieces)</strong>
-                  <span style={{ font: "9px var(--mono)", color: materialBalance > 0 ? "#2f6f44" : materialBalance < 0 ? "#c92a2a" : "#777" }}>
-                    {materialBalance > 0 ? `ขาวได้เปรียบ +${materialBalance}` : materialBalance < 0 ? `ดำได้เปรียบ +${Math.abs(materialBalance)}` : "แต้มวัตถุเท่ากัน"}
-                  </span>
-                </div>
+            {/* Side Info Panel (Standardized with Blackjack & TTT side-panel) */}
+            <aside className="side-panel">
+              <span className="eyebrow">MATCH INFO</span>
+              <h3>สถานะการดวล</h3>
+              <div className="setting-row">
+                <span>AI คู่แข่ง</span>
+                <strong>{chessOpponent === "project" ? selectedPlayProject?.name : chessOpponent === "baseline" ? "Baseline AI" : chessOpponent === "thinking" ? "Thinking AI" : "Master AI"}</strong>
+              </div>
+              <div className="setting-row">
+                <span>กติกา</span>
+                <strong>FIDE Standard · 8x8</strong>
+              </div>
+              <div className="setting-row">
+                <span>ผลการดวลรวม</span>
+                <strong>{chessStats.playerWins}W - {chessStats.aiWins}L - {chessStats.draws}D</strong>
+              </div>
+              <div className="setting-row">
+                <span>ความได้เปรียบ</span>
+                <strong style={{ color: materialBalance > 0 ? "#2f6f44" : materialBalance < 0 ? "#c92a2a" : "#777" }}>
+                  {materialBalance > 0 ? `ขาว +${materialBalance}` : materialBalance < 0 ? `ดำ +${Math.abs(materialBalance)}` : "เท่ากัน"}
+                </strong>
+              </div>
 
-                <div style={{ marginBottom: 6 }}>
-                  <small style={{ color: "#777", display: "block" }}>ฝ่ายขาวกินได้:</small>
-                  <div className="captured-row">
+              {/* Material Captured Box */}
+              <div className="captured-box" style={{ marginTop: 12 }}>
+                <strong>หมากที่ถูกกิน</strong>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", margin: "4px 0" }}>
+                  <small style={{ color: "#888" }}>ขาวกินได้:</small>
+                  <div className="captured-row" style={{ minHeight: "auto", fontSize: 16 }}>
                     {chess.capturedByWhite.map((p, idx) => (
                       <span key={idx} className="black-piece">{PIECE_SYMBOLS.b[p.type]}</span>
                     ))}
-                    {!chess.capturedByWhite.length && <span style={{ fontSize: 11, color: "#aaa" }}>—</span>}
+                    {!chess.capturedByWhite.length && <span style={{ fontSize: 10, color: "#aaa" }}>—</span>}
                   </div>
                 </div>
-
-                <div>
-                  <small style={{ color: "#777", display: "block" }}>ฝ่ายดำกินได้:</small>
-                  <div className="captured-row">
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                  <small style={{ color: "#888" }}>ดำกินได้:</small>
+                  <div className="captured-row" style={{ minHeight: "auto", fontSize: 16 }}>
                     {chess.capturedByBlack.map((p, idx) => (
                       <span key={idx} className="white-piece" style={{ textShadow: "0 0 1px #000" }}>{PIECE_SYMBOLS.w[p.type]}</span>
                     ))}
-                    {!chess.capturedByBlack.length && <span style={{ fontSize: 11, color: "#aaa" }}>—</span>}
+                    {!chess.capturedByBlack.length && <span style={{ fontSize: 10, color: "#aaa" }}>—</span>}
                   </div>
                 </div>
               </div>
 
               {/* Move History Table */}
               <div className="move-history-card">
-                <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8, font: "9px var(--mono)", color: "#777" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6, font: "9px var(--mono)", color: "#777" }}>
                   <span>MOVE HISTORY</span>
                   <span>{Math.ceil(chess.moveHistory.length / 2)} ตาเดิน</span>
                 </div>
-                <div className="move-history-table">
+                <div className="move-history-table" style={{ maxHeight: 150 }}>
                   {Array.from({ length: Math.ceil(chess.moveHistory.length / 2) }).map((_, i) => {
                     const whiteMove = chess.moveHistory[i * 2];
                     const blackMove = chess.moveHistory[i * 2 + 1];
@@ -1099,31 +1251,18 @@ export default function ChessView({
                     );
                   })}
                   {!chess.moveHistory.length && (
-                    <div style={{ gridColumn: "span 3", color: "#aaa", fontSize: 10, padding: "8px 0" }}>
-                      ยังไม่มีการเดินหมาก เริ่มโดยคลิกตัวหมากสีขาว
+                    <div style={{ gridColumn: "span 3", color: "#aaa", fontSize: 10, padding: "4px 0" }}>
+                      คลิกตัวหมากสีขาวเพื่อเริ่มเดิน
                     </div>
                   )}
                 </div>
               </div>
 
-              {/* Reset & Switch & Fullscreen Buttons */}
-              {onToggleFullscreen && (
-                <button
-                  className="fullscreen-btn"
-                  style={{ width: "100%", justifyContent: "center", padding: "10px", marginBottom: 4 }}
-                  onClick={onToggleFullscreen}
-                >
-                  <Maximize2 size={14} />
-                  <span>ขยายกระดานเต็มจอ (Fullscreen)</span>
-                </button>
-              )}
+              {/* Action Buttons in Side Panel */}
               <button className="outline-full" onClick={handleReset}>
-                <RotateCcw size={14} /> เริ่มเกมหมากรุกใหม่
+                <RotateCcw size={14} /> เริ่มเซสชันใหม่
               </button>
-              <button className="secondary-action" onClick={onOpenGameModal}>
-                <Layers size={14} /> สลับไปเล่น Blackjack
-              </button>
-            </div>
+            </aside>
           </div>
         </section>
       )}
@@ -1149,17 +1288,17 @@ export default function ChessView({
             </div>
           </div>
 
-          {/* Sub-mode Switcher Tabs */}
+          {/* Sub-mode Switcher Tabs — สลับ "ประเภทโปรเจกต์" ปัจจุบัน */}
           <div className="engine-mode-tabs" style={{ marginBottom: 18 }}>
             <button
               className={`engine-tab ${trainingSubMode === "deepexplore" ? "selected" : ""}`}
-              onClick={() => setTrainingSubMode("deepexplore")}
+              onClick={() => switchTrainingMode("deepexplore")}
             >
-              <Sparkles size={14} /> 10¹²⁰ Deep Exploration (จำลองกระดานจริง + พัก/ทำต่อได้)
+              <Sparkles size={14} /> 10¹²⁰ Deep Exploration (ตัวของตัวเอง · พัก/ทำต่อได้)
             </button>
             <button
               className={`engine-tab ${trainingSubMode === "standard" ? "selected" : ""}`}
-              onClick={() => setTrainingSubMode("standard")}
+              onClick={() => switchTrainingMode("standard")}
             >
               <Cpu size={14} /> Batch Self-Play RL (เทรนตามเวลา + กราฟสถิติ)
             </button>
@@ -1800,6 +1939,22 @@ export default function ChessView({
                 <option value="heuristic-distill">Tactical Distillation</option>
               </select>
 
+              <label className="field-label">ประเภทโปรเจกต์ (โหมดฝึกของโปรเจกต์นี้ — แต่ละแบบบันทึกข้อมูลของตัวเองแยกกัน)</label>
+              <div className="engine-mode-tabs" style={{ marginBottom: 12 }}>
+                <button
+                  className={`engine-tab ${newProjectMode === "standard" ? "selected" : ""}`}
+                  onClick={() => setNewProjectMode("standard")}
+                >
+                  <Cpu size={14} /> Self-Play RL (Batch เทรนตามเวลา)
+                </button>
+                <button
+                  className={`engine-tab ${newProjectMode === "deepexplore" ? "selected" : ""}`}
+                  onClick={() => setNewProjectMode("deepexplore")}
+                >
+                  <Sparkles size={14} /> 10¹²⁰ Deep Exploration
+                </button>
+              </div>
+
               <button className="primary-action full-action" onClick={handleCreateProject}>
                 <Plus size={14} /> บันทึกและเริ่มโปรเจกต์
               </button>
@@ -1821,6 +1976,9 @@ export default function ChessView({
                     </span>
                     <span style={{ font: "8px var(--mono)", color: "#888", border: "1px solid #e1e1dc", padding: "2px 6px" }}>
                       {p.algorithm}
+                    </span>
+                    <span style={{ font: "8px var(--mono)", color: "#fff", background: p.trainMode === "deepexplore" ? "#1971c2" : "#495057", padding: "2px 6px" }}>
+                      {p.trainMode === "deepexplore" ? "10¹²⁰ DEEP EXPLORE" : "SELF-PLAY RL"}
                     </span>
                   </div>
                   <p>
@@ -1848,11 +2006,7 @@ export default function ChessView({
                   </button>
                   <button
                     className="secondary-action action-button"
-                    onClick={() => {
-                      setActiveTrainingId(p.id);
-                      setTrainMinutes(p.minutes);
-                      setPage("training");
-                    }}
+                    onClick={() => openTrainingFor(p)}
                   >
                     <BrainCircuit size={13} /> ฝึกต่อ
                   </button>
@@ -1860,7 +2014,11 @@ export default function ChessView({
                     <button
                       className="top-icon"
                       title="ลบโปรเจกต์"
-                      onClick={() => setChessProjects(prev => prev.filter(x => x.id !== p.id))}
+                      onClick={() => {
+                        // ลบ slot การสำรวจของโปรเจกต์ตัวนี้ด้วย เพื่อไม่ให้ข้อมูลค้างกองอยู่
+                        clearStoredData(deepExploreKey(p.id));
+                        setChessProjects(prev => prev.filter(x => x.id !== p.id));
+                      }}
                     >
                       <Trash2 size={13} />
                     </button>

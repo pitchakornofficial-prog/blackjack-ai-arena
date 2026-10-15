@@ -20,6 +20,12 @@ export interface ChessTrainingProject {
   weights: ChessModelWeights;
   winRate: number;
   depth: number;
+  /**
+   * ประเภทโปรเจกต์: "standard" = Batch Self-Play RL (เทรนตามเวลา + กราฟ)
+   * "deepexplore" = 10^120 Deep Exploration (สำรวจกระดานจริง แบบ per-project slot)
+   * Optional เพื่อรองรับโปรเจกต์ที่บันทึกไว้ก่อนเวอร์ชันนี้ (ถอดรหัสเป็น standard)
+   */
+  trainMode?: "standard" | "deepexplore";
 }
 
 export interface ChessMetricPoint {
@@ -255,6 +261,50 @@ export function initDeepExplore(weights?: ChessModelWeights): DeepExploreState {
     halfmoveClock: 0,
     computeEngine: "headless",
     hardwareAccelerator: "auto"
+  };
+}
+
+/**
+ * Validator for a restored Deep Exploration session snapshot (used by the
+ * persistence layer). Only loose structural checks live here — Cohen
+ * reviving/repairing partial payloads is done in `reviveDeepExplore`.
+ */
+export function isDeepExploreSnapshot(value: unknown): value is DeepExploreState {
+  if (typeof value !== "object" || value === null) return false;
+  const s = value as DeepExploreState;
+  return (
+    typeof s.totalPositionsExplored === "number" &&
+    typeof s.totalGamesPlayed === "number" &&
+    typeof s.epsilon === "number" &&
+    Number.isFinite(s.totalPositionsExplored) &&
+    typeof s.weights === "object" &&
+    s.weights !== null
+  );
+}
+
+/**
+ * Rebuilds a full, safe DeepExploreState from a partially-loaded snapshot:
+ * - missing ChessState fields are filled from a fresh game
+ * - weights are merged over DEFAULT_CHESS_WEIGHTS so no evaluation weight
+ *   can be undefined inside the training loop
+ * - the session is restored PAUSED so nothing runs until the user resumes
+ */
+export function reviveDeepExplore(saved: DeepExploreState): DeepExploreState {
+  const base = initDeepExplore();
+  const baseFen = boardToFen(base.currentGame.board, base.currentGame.turn);
+  return {
+    ...base,
+    ...saved,
+    currentGame: saved.currentGame
+      ? { ...base.currentGame, ...saved.currentGame }
+      : base.currentGame,
+    weights: { ...DEFAULT_CHESS_WEIGHTS, ...(saved.weights ?? {}) },
+    paused: true,
+    positionHistory:
+      typeof saved.positionHistory === "object" && saved.positionHistory !== null
+        ? saved.positionHistory
+        : { [baseFen]: 1 },
+    speed: typeof saved.speed === "number" ? saved.speed : base.speed
   };
 }
 
