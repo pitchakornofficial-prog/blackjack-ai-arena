@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import {
-  BrainCircuit, Cpu, FolderKanban, Pause, Play, Plus, RotateCcw, ShieldCheck, Sparkles, Swords, Trash2,
+  BrainCircuit, Cpu, FolderKanban, Pause, Play, Plus, RotateCcw, ShieldCheck, Sparkles, Swords, Trash2, Edit2,
   BookOpen, Maximize2, Minimize2
 } from "lucide-react";
 import {
@@ -12,6 +12,7 @@ import {
 } from "./tttTraining";
 import { STORAGE_KEYS, isProjectRecordArray, loadStoredData, saveStoredData } from "./persistence";
 import ProjectCreateModal, { TRAINING_BATCH_OPTIONS, TRAINING_DURATION_OPTIONS } from "./ProjectCreateModal";
+import ProjectEditModal from "./ProjectEditModal";
 
 type TTTViewProps = {
   page: string;
@@ -67,8 +68,8 @@ export default function TTTView({ page, setPage, isFullscreen, onToggleFullscree
   const projectsRef = useRef(tttProjects);
   projectsRef.current = tttProjects;
   const trainingWorkerRef = useRef<Worker | null>(null);
-  const [activeTrainingId, setActiveTrainingId] = useState<number>(() => tttProjects[0]?.id ?? 1);
-  const [selectedPlayProjectId, setSelectedPlayProjectId] = useState<number>(1);
+  const [activeTrainingId, setActiveTrainingId] = useState<number>(() => tttProjects[0]?.id ?? 0);
+  const [selectedPlayProjectId, setSelectedPlayProjectId] = useState<number>(() => tttProjects[0]?.id ?? 0);
   const [trainingRunning, setTrainingRunning] = useState(false);
   const [trainingError, setTrainingError] = useState<string | null>(null);
   const [trainingStartedAt, setTrainingStartedAt] = useState<number | null>(null);
@@ -82,6 +83,7 @@ export default function TTTView({ page, setPage, isFullscreen, onToggleFullscree
   const [metricHistory, setMetricHistory] = useState<TTTMetricPoint[]>(() => tttProjects[0]?.metricHistory ?? []);
   const [chartView, setChartView] = useState<"winrate" | "reward" | "epsilon">("winrate");
   const [showNewProject, setShowNewProject] = useState(false);
+  const [editingProject, setEditingProject] = useState<TTTTrainingProject | null>(null);
   const [newProjectName, setNewProjectName] = useState("Nova O-Model");
   const [newProjectAlgo, setNewProjectAlgo] = useState<TTTAlgorithm>("selfplay-rl");
 
@@ -258,7 +260,7 @@ export default function TTTView({ page, setPage, isFullscreen, onToggleFullscree
   /* ---------------- Training control functions ---------------- */
 
   function beginTraining(project: TTTTrainingProject, minutes: number, resumeAccumulated = true) {
-    const elapsed = resumeAccumulated ? project.elapsedSeconds : 0;
+    const elapsed = resumeAccumulated && project.elapsedSeconds < minutes * 60 ? project.elapsedSeconds : 0;
     const history = resumeAccumulated ? project.metricHistory : [];
     const updatedProjects = projectsRef.current.map(p => p.id === project.id
       ? {
@@ -317,6 +319,11 @@ export default function TTTView({ page, setPage, isFullscreen, onToggleFullscree
 
   function resumeTraining() {
     if (!activeTrainingId) return;
+    const project = projectsRef.current.find(item => item.id === activeTrainingId);
+    if (project && project.elapsedSeconds >= totalTrainingSeconds) {
+      beginTraining(project, trainMinutes, true);
+      return;
+    }
     setTrainingError(null);
     setTrainingStartedAt(Date.now());
     setTrainingRunning(true);
@@ -400,7 +407,8 @@ export default function TTTView({ page, setPage, isFullscreen, onToggleFullscree
   }
 
   function handleDeleteProject(id: number) {
-    if (tttProjects.length <= 1) return;
+    const project = projectsRef.current.find(item => item.id === id);
+    if (!project || !window.confirm(`ต้องการลบโปรเจกต์ "${project.name}" และข้อมูลการฝึกทั้งหมดหรือไม่?`)) return;
     if (activeTrainingId === id) {
       pauseTraining();
       setTrainingSeconds(0);
@@ -412,12 +420,24 @@ export default function TTTView({ page, setPage, isFullscreen, onToggleFullscree
     setTttProjects(updatedProjects);
     if (activeTrainingId === id) {
       const nextProject = updatedProjects[0];
-      setActiveTrainingId(nextProject.id);
-      setTrainMinutes(nextProject.minutes);
-      setTrainingSeconds(nextProject.elapsedSeconds);
-      setTrainingBaseSeconds(nextProject.elapsedSeconds);
-      setMetricHistory(nextProject.metricHistory);
+      setActiveTrainingId(nextProject?.id ?? 0);
+      setTrainMinutes(nextProject?.minutes ?? 1);
+      setTrainingSeconds(nextProject?.elapsedSeconds ?? 0);
+      setTrainingBaseSeconds(nextProject?.elapsedSeconds ?? 0);
+      setMetricHistory(nextProject?.metricHistory ?? []);
     }
+    if (selectedPlayProjectId === id) setSelectedPlayProjectId(updatedProjects[0]?.id ?? 0);
+  }
+
+  function saveProjectEdits(name: string, minutes: number) {
+    if (!editingProject) return;
+    const updatedProjects = projectsRef.current.map(project => project.id === editingProject.id
+      ? { ...project, name, minutes }
+      : project);
+    projectsRef.current = updatedProjects;
+    setTttProjects(updatedProjects);
+    if (activeTrainingId === editingProject.id) setTrainMinutes(minutes);
+    setEditingProject(null);
   }
 
   function selectPlayProject(id: number) {
@@ -556,7 +576,11 @@ export default function TTTView({ page, setPage, isFullscreen, onToggleFullscree
           <div className="opponent-grid four-cols">
             <button
               className={`opponent-card ${tttOpponent === "project" ? "chosen" : ""}`}
-              onClick={() => selectPlayProject(selectedPlayProject?.id ?? tttProjects[0].id)}
+              onClick={() => {
+                const projectId = selectedPlayProject?.id ?? tttProjects[0]?.id;
+                if (projectId !== undefined) selectPlayProject(projectId);
+                else setTttOpponent("project");
+              }}
               title="คู่แข่งจากโปรเจกต์ที่คุณเทรนเอง"
             >
               <span className="opponent-icon"><Cpu /></span>
@@ -579,6 +603,28 @@ export default function TTTView({ page, setPage, isFullscreen, onToggleFullscree
               </button>
             ))}
           </div>
+          {tttOpponent === "project" && (
+            <div className="project-ai-selector-box">
+              <label className="selector-title" htmlFor="ttt-play-project">
+                <FolderKanban size={16} />
+                <strong>เลือกโปรเจกต์ที่ต้องการใช้เล่น</strong>
+              </label>
+              <select
+                id="ttt-play-project"
+                value={selectedPlayProject?.id ?? ""}
+                onChange={event => selectPlayProject(Number(event.target.value))}
+                disabled={tttProjects.length === 0}
+              >
+                {tttProjects.length === 0
+                  ? <option value="">ยังไม่มีโปรเจกต์ — สร้างในหน้า AI Training</option>
+                  : tttProjects.map(project => (
+                    <option key={project.id} value={project.id}>
+                      {project.name} · {project.games.toLocaleString()} เกม · {knownStatesCount(project.qTable)} สถานะ
+                    </option>
+                  ))}
+              </select>
+            </div>
+          )}
 
           <div className="game-layout">
             <div className="game-board">
@@ -827,7 +873,7 @@ export default function TTTView({ page, setPage, isFullscreen, onToggleFullscree
                 </button>
                 <button
                   className="primary-action"
-                  disabled={!activeTrainingId || trainingRunning || trainingSeconds >= totalTrainingSeconds}
+                  disabled={!activeTrainingId || trainingRunning}
                   onClick={() => {
                     if (!activeProject) return;
                     if (trainingSeconds > 0) resumeTraining();
@@ -922,6 +968,12 @@ export default function TTTView({ page, setPage, isFullscreen, onToggleFullscree
           </div>
 
           <div className="project-list">
+            {tttProjects.length === 0 && (
+              <div className="notice">
+          <FolderKanban size={18} />
+          <div><strong>ยังไม่มีโปรเจกต์</strong><small>สร้างโปรเจกต์ใหม่เพื่อเริ่มฝึกโมเดล</small></div>
+              </div>
+            )}
             {tttProjects.map(p => (
               <div className="project-card" key={p.id}>
                 <div className="project-symbol">
@@ -960,17 +1012,14 @@ export default function TTTView({ page, setPage, isFullscreen, onToggleFullscree
                     className="secondary-action action-button"
                     onClick={() => openTrainingFor(p)}
                   >
-                    <BrainCircuit size={13} /> ฝึกต่อ
+                    <BrainCircuit size={13} /> ฝึก / ฝึกต่อ
                   </button>
-                  {tttProjects.length > 1 && (
-                    <button
-                      className="top-icon"
-                      title="ลบโปรเจกต์"
-                      onClick={() => handleDeleteProject(p.id)}
-                    >
-                      <Trash2 size={13} />
-                    </button>
-                  )}
+                  <button className="top-icon" title="แก้ไขโปรเจกต์" onClick={() => setEditingProject(p)}>
+                    <Edit2 size={13} />
+                  </button>
+                  <button className="top-icon" title="ลบโปรเจกต์" onClick={() => handleDeleteProject(p.id)}>
+                    <Trash2 size={13} />
+                  </button>
                 </div>
               </div>
             ))}
@@ -1071,6 +1120,15 @@ export default function TTTView({ page, setPage, isFullscreen, onToggleFullscree
             <option value="random-drill">{ALGORITHM_INFO["random-drill"].name} — {ALGORITHM_INFO["random-drill"].tag}</option>
           </select>
         </ProjectCreateModal>
+      )}
+      {editingProject && (
+        <ProjectEditModal
+          gameName="Tic Tac Toe"
+          projectName={editingProject.name}
+          minutes={editingProject.minutes}
+          onClose={() => setEditingProject(null)}
+          onSave={saveProjectEdits}
+        />
       )}
     </>
   );

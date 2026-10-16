@@ -91,7 +91,6 @@ export function saveStoredData<T>(key: string, data: T): void {
 export function isProjectRecordArray(value: unknown): boolean {
   return (
     Array.isArray(value) &&
-    value.length > 0 &&
     value.every(
       entry =>
         typeof entry === "object" &&

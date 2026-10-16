@@ -3,7 +3,7 @@ import {
   ArrowRight, BookOpen, BrainCircuit, CheckCircle2,
   Cpu, RotateCcw, ShieldCheck, Sparkles, Swords, Trophy,
   Gauge, FolderKanban, Play, Pause, Plus,
-  Clock3, Info, Trash2, Maximize2, Minimize2, Undo2
+  Clock3, Info, Trash2, Maximize2, Minimize2, Undo2, Edit2
 } from "lucide-react";
 import {
   ChessState, Piece, PieceColor, PieceType, Square,
@@ -20,6 +20,7 @@ import {
 import { detectGpuHardware, GpuDeviceInfo, dispatchGpuBatchEvaluation } from "./gpuAccelerator";
 import { loadStoredData, saveStoredData, clearStoredData, isProjectRecordArray, deepExploreKey, STORAGE_KEYS } from "./persistence";
 import ProjectCreateModal, { TRAINING_BATCH_OPTIONS, TRAINING_DURATION_OPTIONS } from "./ProjectCreateModal";
+import ProjectEditModal from "./ProjectEditModal";
 
 const PIECE_SYMBOLS: Record<PieceColor, Record<PieceType, string>> = {
   w: { k: "♔", q: "♕", r: "♖", b: "♗", n: "♘", p: "♙" },
@@ -87,9 +88,10 @@ export default function ChessView({
 
   // Chess Projects State — restored from localStorage across reloads
   const [chessProjects, setChessProjects] = useState<ChessTrainingProject[]>(restoreChessProjects);
-  const [activeTrainingId, setActiveTrainingId] = useState<number>(1);
-  const [selectedPlayProjectId, setSelectedPlayProjectId] = useState<number>(1);
+  const [activeTrainingId, setActiveTrainingId] = useState<number>(() => chessProjects[0]?.id ?? 0);
+  const [selectedPlayProjectId, setSelectedPlayProjectId] = useState<number>(() => chessProjects[0]?.id ?? 0);
   const [showNewProject, setShowNewProject] = useState(false);
+  const [editingProject, setEditingProject] = useState<ChessTrainingProject | null>(null);
   const [newProjectName, setNewProjectName] = useState("AlphaPawn Chess");
   const [newProjectAlgo, setNewProjectAlgo] = useState<ChessAlgorithm>("selfplay-rl");
   // ประเภทโปรเจกต์ที่เลือกตอนสร้าง: แยกโหมดฝึกของแต่ละโปรเจกต์ออกจากกัน
@@ -625,24 +627,26 @@ export default function ChessView({
   }
 
   function handleDeleteProject(projectId: number) {
-    if (chessProjectsRef.current.length <= 1) return;
+    const project = chessProjectsRef.current.find(item => item.id === projectId);
+    if (!project || !window.confirm(`ต้องการลบโปรเจกต์ "${project.name}" และข้อมูลการฝึกทั้งหมดหรือไม่?`)) return;
     if (trainingRunning && activeTrainingId === projectId) pauseTraining();
 
     const remainingProjects = chessProjectsRef.current.filter(project => project.id !== projectId);
     const nextProject = remainingProjects[0];
     if (activeTrainingId === projectId) {
-      setActiveTrainingId(nextProject.id);
-      setTrainMinutes(nextProject.minutes);
-      setTrainingDevice(nextProject.trainingDevice);
-      setTrainingAlgorithm(nextProject.algorithm);
-      setTrainingSeconds(nextProject.elapsedSeconds);
-      setTrainingBaseSeconds(nextProject.elapsedSeconds);
-      setMetricHistory(nextProject.metricHistory);
-      setTrainingSubMode(nextProject.trainMode === "deepexplore" ? "deepexplore" : "standard");
+      setActiveTrainingId(nextProject?.id ?? 0);
+      setTrainMinutes(nextProject?.minutes ?? 1);
+      setTrainingDevice(nextProject?.trainingDevice ?? "cpu");
+      setTrainingAlgorithm(nextProject?.algorithm ?? "selfplay-rl");
+      setTrainingSeconds(nextProject?.elapsedSeconds ?? 0);
+      setTrainingBaseSeconds(nextProject?.elapsedSeconds ?? 0);
+      setMetricHistory(nextProject?.metricHistory ?? []);
+      setTrainingSubMode(nextProject?.trainMode === "deepexplore" ? "deepexplore" : "standard");
     }
 
+    if (selectedPlayProjectId === projectId) setSelectedPlayProjectId(nextProject?.id ?? 0);
     if (deepExploreProjectId === projectId) {
-      if (nextProject.trainMode === "deepexplore") {
+      if (nextProject?.trainMode === "deepexplore") {
         ensureDeepExploreSlot(nextProject.id);
       } else {
         workerRef.current?.terminate();
@@ -669,7 +673,7 @@ export default function ChessView({
       setPage("training");
       return;
     }
-    const elapsed = resumeAccumulated ? project.elapsedSeconds : 0;
+    const elapsed = resumeAccumulated && project.elapsedSeconds < trainMinutes * 60 ? project.elapsedSeconds : 0;
     const history = resumeAccumulated ? project.metricHistory : [];
     updateChessProjects(old => old.map(p => {
       if (p.id !== project.id) return p;
@@ -715,6 +719,10 @@ export default function ChessView({
 
   function resumeTraining() {
     if (!activeTrainingId) return;
+    if (activeProject && trainingSeconds >= totalTrainingSeconds) {
+      beginTraining(activeProject);
+      return;
+    }
     setTrainingError(null);
     setTrainingStartedAt(Date.now());
     setTrainingRunning(true);
@@ -771,6 +779,15 @@ export default function ChessView({
     setTrainingAlgorithm(newProjectAlgo);
     setTrainingSubMode(newProjectMode);
     setShowNewProject(false);
+  }
+
+  function saveProjectEdits(name: string, minutes: number) {
+    if (!editingProject) return;
+    updateChessProjects(projects => projects.map(project => project.id === editingProject.id
+      ? { ...project, name, minutes }
+      : project));
+    if (activeTrainingId === editingProject.id) setTrainMinutes(minutes);
+    setEditingProject(null);
     setNewProjectName("AlphaPawn Chess");
   }
 
@@ -1112,10 +1129,13 @@ export default function ChessView({
                   <select
                     value={selectedPlayProjectId}
                     onChange={e => setSelectedPlayProjectId(Number(e.target.value))}
+                    disabled={chessProjects.length === 0}
                   >
-                    {chessProjects.map(p => (
-                      <option key={p.id} value={p.id}>{p.name}</option>
-                    ))}
+                    {chessProjects.length === 0
+                      ? <option value={0}>ยังไม่มีโปรเจกต์ — สร้างในหน้า AI Training</option>
+                      : chessProjects.map(p => (
+                        <option key={p.id} value={p.id}>{p.name}</option>
+                      ))}
                   </select>
                 )}
               </div>
@@ -1273,12 +1293,15 @@ export default function ChessView({
               <select
                 value={selectedPlayProjectId}
                 onChange={e => setSelectedPlayProjectId(Number(e.target.value))}
+                disabled={chessProjects.length === 0}
               >
-                {chessProjects.map(p => (
-                  <option key={p.id} value={p.id}>
-                    {p.name} ({p.status === "Complete" ? "เทรนเสร็จสมบูรณ์" : p.games > 0 ? `เทรนแล้ว ${p.games.toLocaleString()} กระดาน` : "ยังไม่ผ่านการเทรน"}) · {p.algorithm}
-                  </option>
-                ))}
+                {chessProjects.length === 0
+                  ? <option value={0}>ยังไม่มีโปรเจกต์ — สร้างในหน้า AI Training</option>
+                  : chessProjects.map(p => (
+                    <option key={p.id} value={p.id}>
+                      {p.name} ({p.status === "Complete" ? "เทรนเสร็จสมบูรณ์" : p.games > 0 ? `เทรนแล้ว ${p.games.toLocaleString()} กระดาน` : "ยังไม่ผ่านการเทรน"}) · {p.algorithm}
+                    </option>
+                  ))}
               </select>
 
               <div className="selected-project-badge">
@@ -1875,7 +1898,7 @@ export default function ChessView({
                 </button>
                 <button
                   className="primary-action"
-                  disabled={!activeTrainingId || trainingRunning || trainingSeconds >= totalTrainingSeconds}
+                  disabled={!activeTrainingId || trainingRunning}
                   onClick={() => {
                     if (!activeProject) return;
                     if (trainingSeconds > 0) resumeTraining();
@@ -1983,6 +2006,12 @@ export default function ChessView({
 
           {/* Project List */}
           <div className="project-list">
+            {chessProjects.length === 0 && (
+              <div className="notice">
+                <FolderKanban size={18} />
+                <div><strong>ยังไม่มีโปรเจกต์</strong><small>สร้างโปรเจกต์ใหม่เพื่อเริ่มฝึกโมเดล</small></div>
+              </div>
+            )}
             {chessProjects.map(p => (
               <div className="project-card" key={p.id}>
                 <div className="project-symbol">
@@ -2030,17 +2059,14 @@ export default function ChessView({
                     className="secondary-action action-button"
                     onClick={() => openTrainingFor(p)}
                   >
-                    <BrainCircuit size={13} /> ฝึกต่อ
+                    <BrainCircuit size={13} /> ฝึก / ฝึกต่อ
                   </button>
-                  {chessProjects.length > 1 && (
-                    <button
-                      className="top-icon"
-                      title="ลบโปรเจกต์"
-                      onClick={() => handleDeleteProject(p.id)}
-                    >
-                      <Trash2 size={13} />
-                    </button>
-                  )}
+                  <button className="top-icon" title="แก้ไขโปรเจกต์" onClick={() => setEditingProject(p)}>
+                    <Edit2 size={13} />
+                  </button>
+                  <button className="top-icon" title="ลบโปรเจกต์" onClick={() => handleDeleteProject(p.id)}>
+                    <Trash2 size={13} />
+                  </button>
                 </div>
               </div>
             ))}
@@ -2166,6 +2192,15 @@ export default function ChessView({
             <option value="deepexplore">10¹²⁰ Deep Exploration</option>
           </select>
         </ProjectCreateModal>
+      )}
+      {editingProject && (
+        <ProjectEditModal
+          gameName="Chess"
+          projectName={editingProject.name}
+          minutes={editingProject.minutes}
+          onClose={() => setEditingProject(null)}
+          onSave={saveProjectEdits}
+        />
       )}
     </>
   );

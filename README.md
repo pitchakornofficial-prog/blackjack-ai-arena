@@ -20,6 +20,7 @@ npm run build
 - **Real-Time Simulation & Dynamic Chart (กราฟจริง)**: เครื่องจำลองการฝึกเล่น Blackjack จริงในเบราว์เซอร์ คำนวณค่า Q-Table และพล็อตกราฟอัตราชนะ (Win Rate %), รางวัลเฉลี่ย (Average Reward) และ Exploration Rate (ε) สดๆ ระหว่างฝึก
 - **Accurate Duration Timer**: เลือกระยะเวลาฝึก 1, 5, 10, 15, 30 หรือ 60 นาที; เวลาและความคืบหน้าซิงค์กับโปรเจกต์ที่เลือก
 - **Automatic Training Saves**: แยกข้อมูลฝึกตามเกมและบันทึกโปรเจกต์ Blackjack/Chess/Tic-Tac-Toe, สถานะ, เวลา, โมเดล และกราฟลงใน browser storage อัตโนมัติ รวมถึงเมื่อหยุดฝึกก่อนครบเวลา
+- **Training Project Management**: แก้ไขชื่อและเวลาเป้าหมาย ลบโปรเจกต์ และฝึกต่อจากโมเดลเดิมได้ทุกเกม พร้อมเลือกโปรเจกต์ AI ที่จะใช้เล่นใน Arena
 - **Separate Views**: Overview, Play Arena, AI Training, AI Projects, Rules, and Play Assist.
 
 ## v0.5 Updates

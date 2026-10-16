@@ -3,7 +3,7 @@ import {
   ArrowLeft, ArrowRight, BrainCircuit, BookOpen, CircleHelp, Clock3, Code2,
   Cpu, FolderKanban, Gauge, House, Info, Play, Plus, RotateCcw, Settings2,
   ShieldCheck, Sparkles, Swords, Trophy, WandSparkles, X, CheckCircle2,
-  Layers, Maximize2, Minimize2, Home
+  Layers, Maximize2, Minimize2, Home, Edit2, Trash2
 } from "lucide-react";
 import {
   Action, Card as PlayingCard, GameState, applyAction, applyAiAction,
@@ -13,11 +13,13 @@ import { QTable, MetricPoint, trainBatch } from "./game/trainer";
 import { getAiDecision } from "./game/aiAgent";
 import { detectGpuHardware, dispatchGpuBatchEvaluation } from "./game/gpuAccelerator";
 import ProjectCreateModal, { TRAINING_DURATION_OPTIONS } from "./game/ProjectCreateModal";
+import ProjectEditModal from "./game/ProjectEditModal";
 import ChessView from "./game/ChessView";
 import TTTView from "./game/TTTView";
 import { loadStoredData, saveStoredData, isProjectRecordArray, STORAGE_KEYS } from "./game/persistence";
 
 type ActiveGame = "blackjack" | "chess" | "ttt" | "undecided";
+type GameCategory = "card" | "board";
 
 type Page = "home" | "play" | "training" | "projects" | "rules" | "help";
 type Opponent = "baseline" | "thinking" | "project";
@@ -58,6 +60,84 @@ function Card({ card, hidden = false }: { card?: PlayingCard; hidden?: boolean }
   );
 }
 
+function GameSelection({
+  category,
+  onSelectCategory,
+  activeGame,
+  onPickGame
+}: {
+  category: GameCategory | null;
+  onSelectCategory: (category: GameCategory | null) => void;
+  activeGame: ActiveGame;
+  onPickGame: (game: ActiveGame) => void;
+}) {
+  if (!category) {
+    return (
+      <div className="game-category-grid">
+        <button className="game-category-card" onClick={() => onSelectCategory("card")}>
+          <span className="game-category-icon">♠</span>
+          <strong>เกมการ์ด</strong>
+          <p>เกมไพ่และการวางกลยุทธ์</p>
+          <span className="game-category-count">1 เกม</span>
+        </button>
+        <button className="game-category-card" onClick={() => onSelectCategory("board")}>
+          <span className="game-category-icon">♟</span>
+          <strong>เกมกระดาน</strong>
+          <p>เกมวางแผนและดวลบนกระดาน</p>
+          <span className="game-category-count">2 เกม</span>
+        </button>
+      </div>
+    );
+  }
+
+  const games = category === "card"
+    ? [{
+        id: "blackjack" as const,
+        icon: "♠",
+        name: "Blackjack AI Arena",
+        description: "สนามไพ่ 21 แต้ม ดวลสลับตากับ AI พร้อมเทรน Q-Learning",
+        tag: "ไพ่ · สลับเทิร์น · Q-Learning"
+      }]
+    : [{
+        id: "chess" as const,
+        icon: "♞",
+        name: "Chess AI Arena (หมากรุก)",
+        description: "กระดานหมากรุกสากล 8x8 ดวลสลับตากับ Minimax Chess AI",
+        tag: "หมากรุก · สลับเทิร์น · Minimax"
+      }, {
+        id: "ttt" as const,
+        icon: "⭘",
+        name: "Tic Tac Toe AI Arena",
+        description: "เกม 3 ช่องชนะ ดวลกับ AI ตั้งแต่อ่อนแรงถึง Minimax ที่แพ้ไม่ได้",
+        tag: "O/X · สลับเทิร์น · Minimax"
+      }];
+
+  return (
+    <div className="game-selection">
+      <div className="game-selection-heading">
+        <button className="game-category-back" onClick={() => onSelectCategory(null)}>
+          <ArrowLeft size={13} /> หมวดหมู่เกม
+        </button>
+        <span>{category === "card" ? "เกมการ์ด" : "เกมกระดาน"}</span>
+      </div>
+      <div className="game-choice-grid game-selection-games">
+        {games.map(game => (
+          <button
+            key={game.id}
+            className={`game-choice-card ${activeGame === game.id ? "dark-card" : ""}`}
+            onClick={() => onPickGame(game.id)}
+          >
+            <div className="game-choice-icon">{game.icon}</div>
+            <strong>{game.name}</strong>
+            <p>{game.description}</p>
+            <span className="game-choice-tag">{game.tag}</span>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 // Restore saved projects (with trained Q-Tables) from localStorage; keep the
 // in-memory fallback for fresh browsers so the workspace is never empty.
 const savedBlackjackProjects = loadStoredData<TrainingProject[]>(
@@ -86,6 +166,7 @@ export default function App() {
   const [gamePicked, setGamePicked] = useState(false);
   const showInitialGamePicker = activeGame === "undecided" && !gamePicked;
   const [showGameModal, setShowGameModal] = useState(false);
+  const [selectedGameCategory, setSelectedGameCategory] = useState<GameCategory | null>(null);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [page, setPage] = useState<Page>("home");
   const [game, setGame] = useState<GameState>(newGame(Math.random, "play", "duel"));
@@ -133,6 +214,7 @@ export default function App() {
   const [discountFactor, setDiscountFactor] = useState(0.95);
   const [explorationRate, setExplorationRate] = useState(0.2);
   const [showNewProject, setShowNewProject] = useState(false);
+  const [editingProject, setEditingProject] = useState<TrainingProject | null>(null);
   const [helpAction, setHelpAction] = useState<Action | null>(null);
 
   // Real Metrics Chart State
@@ -181,6 +263,7 @@ export default function App() {
     setActiveGame(game);
     setGamePicked(true);
     setShowGameModal(false);
+    setSelectedGameCategory(null);
     // Start a fresh session in the chosen game
     setGame(newGame(Math.random, "play", "duel"));
     setPage("home");
@@ -375,6 +458,32 @@ export default function App() {
     setPage("projects");
   }
 
+  function saveProjectEdits(name: string, minutes: number) {
+    if (!editingProject) return;
+    updateProjects(current => current.map(project => project.id === editingProject.id
+      ? { ...project, name, minutes }
+      : project));
+    if (activeTrainingId === editingProject.id) setTrainMinutes(minutes);
+    setEditingProject(null);
+  }
+
+  function deleteProject(projectId: number) {
+    const project = projectsRef.current.find(item => item.id === projectId);
+    if (!project || !window.confirm(`ต้องการลบโปรเจกต์ "${project.name}" และข้อมูลการฝึกทั้งหมดหรือไม่?`)) return;
+    if (trainingRunning && activeTrainingId === projectId) pauseTraining();
+    const remaining = projectsRef.current.filter(item => item.id !== projectId);
+    updateProjects(() => remaining);
+    if (activeTrainingId === projectId) {
+      const next = remaining[0];
+      setActiveTrainingId(next?.id ?? null);
+      setTrainMinutes(next?.minutes ?? 1);
+      setTrainingSeconds(next?.elapsedSeconds ?? 0);
+      setTrainingBaseSeconds(next?.elapsedSeconds ?? 0);
+      setMetricHistory(next?.metricHistory ?? []);
+    }
+    if (selectedPlayProjectId === projectId) setSelectedPlayProjectId(remaining[0]?.id ?? null);
+  }
+
   function openNewProject() {
     setProjectName("My Blackjack Agent");
     setTrainMinutes(1);
@@ -383,9 +492,10 @@ export default function App() {
     setShowNewProject(true);
   }
 
-  function beginTraining(project: TrainingProject, resumeAccumulated: boolean = true) {
-    const elapsed = resumeAccumulated ? project.elapsedSeconds : 0;
-    const history = resumeAccumulated ? project.metricHistory : [];
+  function beginTraining(project: TrainingProject) {
+    const limit = trainMinutes * 60;
+    const elapsed = project.elapsedSeconds >= limit ? 0 : project.elapsedSeconds;
+    const history = project.metricHistory;
     updateProjects(old => old.map(p => {
       if (p.id !== project.id) return p;
       return {
@@ -393,10 +503,10 @@ export default function App() {
         minutes: trainMinutes,
         status: "Training",
         progress: Math.min(100, (elapsed / Math.max(1, trainMinutes * 60)) * 100),
-        games: resumeAccumulated ? p.games : 0,
+        games: p.games,
         elapsedSeconds: elapsed,
         metricHistory: history,
-        qTable: resumeAccumulated ? (p.qTable ? { ...p.qTable } : {}) : {}
+        qTable: p.qTable ? { ...p.qTable } : {}
       };
     }));
     setActiveTrainingId(project.id);
@@ -426,6 +536,11 @@ export default function App() {
 
   function resumeTraining() {
     if (!activeTrainingId) return;
+    const project = projectsRef.current.find(item => item.id === activeTrainingId);
+    if (project && project.elapsedSeconds >= totalTrainingSeconds) {
+      beginTraining(project);
+      return;
+    }
     setTrainingStartedAt(Date.now());
     setTrainingRunning(true);
   }
@@ -449,6 +564,7 @@ export default function App() {
   }
 
   function handleShowGameModal() {
+    setSelectedGameCategory(null);
     setShowGameModal(true);
   }
 
@@ -654,28 +770,14 @@ export default function App() {
         {showInitialGamePicker ? (
           <div className="game-picker-overlay">
             <div className="game-picker-card">
-              <div className="modal-title">เลือกเกมที่ต้องการเล่น</div>
-              <p className="modal-lede">เลือกเกมเพื่อเริ่มใช้งาน</p>
-              <div className="game-choice-grid">
-                <button className="game-choice-card dark-card" onClick={() => handlePickGame("blackjack")}>
-                  <div className="game-choice-icon">♠</div>
-                  <strong>Blackjack AI Arena</strong>
-                  <p>สนามไพ่ 21 แต้ม ดวลสลับตากับ AI พร้อมเทรน Q-Learning</p>
-                  <span className="game-choice-tag">ไพ่ · สลับเทิร์น · Q-Learning</span>
-                </button>
-                <button className="game-choice-card" onClick={() => handlePickGame("chess")}>
-                  <div className="game-choice-icon">♞</div>
-                  <strong>Chess AI Arena (หมากรุก)</strong>
-                  <p>กระดานหมากรุกสากล 8x8 ดวลสลับตากับ Minimax Chess AI</p>
-                  <span className="game-choice-tag">หมากรุก · สลับเทิร์น · Minimax</span>
-                </button>
-                <button className="game-choice-card" onClick={() => handlePickGame("ttt")}>
-                  <div className="game-choice-icon">⭘</div>
-                  <strong>Tic Tac Toe AI Arena</strong>
-                  <p>เกม 3 ช่องชนะ ดวลกับ AI ตั้งแต่อ่อนแรงถึง Minimax ที่แพ้ไม่ได้</p>
-                  <span className="game-choice-tag">O/X · สลับเทิร์น · Minimax</span>
-                </button>
-              </div>
+              <div className="modal-title">เลือกหมวดหมู่เกมที่อยากเล่น</div>
+              <p className="modal-lede">เลือกหมวดหมู่ แล้วเลือกเกมที่ต้องการเล่น</p>
+              <GameSelection
+                category={selectedGameCategory}
+                onSelectCategory={setSelectedGameCategory}
+                activeGame={activeGame}
+                onPickGame={handlePickGame}
+              />
             </div>
           </div>
         ) : activeGame === "chess" ? (
@@ -836,11 +938,13 @@ export default function App() {
                   value={selectedPlayProjectId ?? ""}
                   onChange={e => setSelectedPlayProjectId(Number(e.target.value))}
                 >
-                  {projects.map(p => (
-                    <option key={p.id} value={p.id}>
-                      {p.name} — {p.qTable && Object.keys(p.qTable).length > 0 ? `ฝึกแล้ว ${p.games.toLocaleString()} มือ (${Object.keys(p.qTable).length} Q-States)` : "ยังไม่ได้ฝึก (0 มือ)"}
-                    </option>
-                  ))}
+                  {projects.length === 0
+                    ? <option value="">ยังไม่มีโปรเจกต์ — สร้างในหน้า AI Training</option>
+                    : projects.map(p => (
+                      <option key={p.id} value={p.id}>
+                        {p.name} — {p.qTable && Object.keys(p.qTable).length > 0 ? `ฝึกแล้ว ${p.games.toLocaleString()} มือ (${Object.keys(p.qTable).length} Q-States)` : "ยังไม่ได้ฝึก (0 มือ)"}
+                      </option>
+                    ))}
                 </select>
                 {selectedPlayProject && (
                   <div className="selected-project-badge">
@@ -1165,10 +1269,10 @@ export default function App() {
                       <div><span style={{ font: "8px var(--mono)", color: "#999", letterSpacing: ".05em" }}>GAMES COMPLETED</span><strong>{(activeProject?.games ?? 0).toLocaleString()}</strong></div>
                       <div><span style={{ font: "8px var(--mono)", color: "#999", letterSpacing: ".05em" }}>MODELS</span><strong>1</strong></div>
                     </div>
-                    <button className="primary-action full-action" onClick={() => beginTraining(activeProject!, false)}>
-                      <RotateCcw size={14} /> ฝึกซ้ำ
+                    <button className="primary-action full-action" onClick={() => beginTraining(activeProject!)}>
+                      <Play size={14} /> ฝึกต่อ
                     </button>
-                    <p style={{ font: "9px var(--mono)", color: "#777", marginTop: 14, textAlign: "center" }}>สถานะ: <span style={{ color: "#4d7656" }}>การฝึกเสร็จสิ้น</span> — กดฝึกซ้ำเพื่อเริ่มใหม่</p>
+                    <p style={{ font: "9px var(--mono)", color: "#777", marginTop: 14, textAlign: "center" }}>โมเดลและข้อมูลเดิมจะถูกเก็บไว้เมื่อฝึกต่อ</p>
                   </div>
                 ) : trainingRunning ? (
                   <div>
@@ -1332,6 +1436,12 @@ export default function App() {
                       >
                         <Play size={13} /> ฝึก
                       </button>
+                      <button className="outline-full" onClick={() => setEditingProject(p)}>
+                        <Edit2 size={13} /> แก้ไข
+                      </button>
+                      <button className="outline-full" onClick={() => deleteProject(p.id)}>
+                        <Trash2 size={13} /> ลบ
+                      </button>
                     </div>
                   </div>
                 ))}
@@ -1473,6 +1583,15 @@ export default function App() {
             </select>
           </ProjectCreateModal>
         )}
+        {editingProject && (
+          <ProjectEditModal
+            gameName="Blackjack"
+            projectName={editingProject.name}
+            minutes={editingProject.minutes}
+            onClose={() => setEditingProject(null)}
+            onSave={saveProjectEdits}
+          />
+        )}
         </>
         )}
           {showGameModal && (
@@ -1497,26 +1616,14 @@ export default function App() {
                     <X size={15} />
                   </button>
                 </div>
-                <p className="modal-lede">เลือกเกมเพื่อสลับไปยังสนามที่ต้องการ</p>
-                <div className="game-modal-body game-choice-grid">
-                  <button className={`game-choice-card ${activeGame === "blackjack" ? "dark-card" : ""}`} onClick={() => handlePickGame("blackjack")}>
-                    <div className="game-choice-icon">♠</div>
-                    <strong>Blackjack AI Arena</strong>
-                    <p>สนามไพ่ 21 แต้ม ดวลสลับตากับ AI พร้อมเทรน Q-Learning</p>
-                    <span className="game-choice-tag">ไพ่ · สลับเทิร์น · Q-Learning</span>
-                  </button>
-                  <button className={`game-choice-card ${activeGame === "chess" ? "dark-card" : ""}`} onClick={() => handlePickGame("chess")}>
-                    <div className="game-choice-icon">♞</div>
-                    <strong>Chess AI Arena (หมากรุก)</strong>
-                    <p>กระดานหมากรุกสากล 8x8 ดวลสลับตากับ Minimax Chess AI</p>
-                    <span className="game-choice-tag">หมากรุก · สลับเทิร์น · Minimax</span>
-                  </button>
-                  <button className={`game-choice-card ${activeGame === "ttt" ? "dark-card" : ""}`} onClick={() => handlePickGame("ttt")}>
-                    <div className="game-choice-icon">⭘</div>
-                    <strong>Tic Tac Toe AI Arena</strong>
-                    <p>เกม 3 ช่องชนะ ดวลกับ AI ตั้งแต่อ่อนแรงถึง Minimax ที่แพ้ไม่ได้</p>
-                    <span className="game-choice-tag">O/X · สลับเทิร์น · Minimax</span>
-                  </button>
+                <p className="modal-lede">เลือกหมวดหมู่ แล้วเลือกเกมเพื่อสลับไปยังสนามที่ต้องการ</p>
+                <div className="game-modal-body game-selection-container">
+                  <GameSelection
+                    category={selectedGameCategory}
+                    onSelectCategory={setSelectedGameCategory}
+                    activeGame={activeGame}
+                    onPickGame={handlePickGame}
+                  />
                 </div>
               </section>
             </div>

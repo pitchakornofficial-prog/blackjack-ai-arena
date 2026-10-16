@@ -53,10 +53,11 @@
 .game-switch-btn{display:flex;align-items:center;gap:7px;padding:6px 12px;background:#fff;border:1px solid var(--line);font:9px var(--mono);color:#191919;cursor:pointer;border-radius:2px}
 .game-switch-btn:hover{background:#f1f1ed}
 .game-modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;z-index:999;padding:20px;backdrop-filter:blur(2px)}
-.game-modal{background:#fff;border:1px solid var(--line);width:100%;max-width:680px;box-shadow:0 12px 36px rgba(0,0,0,.25)}
+.game-modal{background:#fff;border:1px solid var(--line);width:100%;max-width:760px;box-shadow:0 12px 36px rgba(0,0,0,.25)}
 .game-modal-header{padding:18px 22px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center}
 .game-modal-body{padding:22px;display:grid;grid-template-columns:1fr 1fr;gap:16px}
 .game-modal-body.game-choice-grid{grid-template-columns:repeat(3,minmax(0,1fr))}
+.game-modal-body.game-selection-container{display:block;padding:0}
 .game-card-pick{text-align:left;border:2px solid var(--line);background:#fafaf8;padding:20px;display:flex;flex-direction:column;cursor:pointer;transition:all .2s ease;color:#191919}
 .game-card-pick:hover,.game-card-pick.active{border-color:#191919;background:#fff;box-shadow:0 4px 16px rgba(0,0,0,.08)}
 .game-card-pick .game-icon{font-size:36px;margin-bottom:12px}
@@ -75,7 +76,7 @@
 .project-create-modal .game-modal-footer{flex:none}
 .project-create-modal .game-modal-footer .ghost-button{min-height:40px}
 .project-create-trigger{width:100%;margin-top:14px}
-@media(max-width:680px){.game-modal-body.game-choice-grid{grid-template-columns:1fr}}
+@media(max-width:680px){.game-modal-body.game-choice-grid,.game-category-grid,.game-choice-grid.game-selection-games{grid-template-columns:1fr}}
 
 /* Modal เลือกเกมแรก (สไตล์เก่า) */
 .auth-overlay{position:fixed;inset:0;background:#fff;display:flex;align-items:center;justify-content:center;z-index:1000;padding:30px}
@@ -91,6 +92,17 @@
 .game-choice-card p{font-size:11px;color:#777;line-height:1.6;margin:0 0 14px;flex:1}
 .game-choice-card .game-choice-tag{font:8px var(--mono);color:#999;letter-spacing:.06em}
 .game-choice-card.dark-card .game-choice-tag{color:#aaa}
+.game-category-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;padding:22px}
+.game-category-card{text-align:left;border:1px solid var(--line);background:#fafaf8;padding:20px;display:flex;flex-direction:column;align-items:flex-start;min-height:190px;color:#191919;transition:all .2s ease}
+.game-category-card:hover{background:#fff;border-color:#191919;box-shadow:0 4px 14px rgba(0,0,0,.08)}
+.game-category-icon{font-size:34px;margin-bottom:18px}
+.game-category-card strong{font-size:16px}
+.game-category-card p{font-size:11px;color:#777;line-height:1.6;margin:7px 0 18px}
+.game-category-count{margin-top:auto;font:9px var(--mono);color:#999;letter-spacing:.06em}
+.game-selection-heading{display:flex;align-items:center;justify-content:space-between;padding:16px 22px 0;font:10px var(--mono);color:#777}
+.game-category-back{display:flex;align-items:center;gap:5px;padding:5px 0;border:0;background:transparent;color:#777;font:10px var(--mono)}
+.game-category-back:hover{color:#191919}
+.game-choice-grid.game-selection-games{grid-template-columns:repeat(auto-fit,minmax(220px,1fr));padding-top:16px}
 .modal-footer{padding:14px 22px;border-top:1px solid var(--line);display:flex;justify-content:flex-end;background:#fff}
 
 /* ตอนยังไม่เลือกเกม: ซ่อนเฉพาะ sidebar (overlay คลุมทั้งจอด้วย position:fixed) */
